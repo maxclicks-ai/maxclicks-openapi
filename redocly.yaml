@@ -1,0 +1,17 @@
+extends:
+  - recommended
+
+rules:
+  operation-operationId: error
+  operation-operationId-unique: error
+  operation-2xx-response: warn
+  operation-4xx-response: warn
+  no-unused-components: warn
+  tag-description: off
+  info-license: error
+  operation-summary: error
+  security-defined: error
+
+theme:
+  openapi:
+    disableSearch: false
