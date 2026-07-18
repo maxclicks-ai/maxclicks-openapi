@@ -2,21 +2,51 @@ openapi: 3.1.0
 
 info:
   title: maxclicks Public API
-  version: 1.0.0
+  version: 1.1.0
   summary: The official REST API for the maxclicks email, CRM, and automation platform.
   description: >
-    The maxclicks Public API v1. Manage contacts and objects, fire events, send
-    templates, manage webhooks, trigger workflows, and submit forms.
+    The maxclicks Public API v1. Manage contacts and objects, fire events, run imports, generate
+    segments and audiences, send templates and broadcasts, manage domains/senders/topics,
+    manage webhooks, trigger and inspect workflows, manage API keys, and submit forms.
 
 
-    All authenticated endpoints use a bearer API key. Successful responses are
-    wrapped in a `data` envelope (with an optional `warnings` array); list
-    endpoints add a `pagination` block. Errors use a Stripe-style
-    `{ error: { type, code, message } }` envelope.
+    All authenticated endpoints use a bearer API key. Successful responses are wrapped in a
+    `data` envelope (with an optional `warnings` array); list endpoints add a `pagination`
+    block (offset-based, except `events.list`, which is cursor-based). Errors use a
+    Stripe-style `{ error: { type, code, message, issues? } }` envelope: `type` is
+    `invalid_request_error` for every 4xx and `api_error` for every 5xx; `code` is a stable
+    machine-readable string or `null`; `issues` is present only on the handful of validation-gate
+    failures that report more than one problem at once (for example `broadcasts.send`'s
+    `broadcast_invalid`).
 
 
-    Rate limits are enforced per API key: 100 reads per second and 25 writes per
-    second. Exceeding a limit returns `429` with a `Retry-After` header.
+    Rate limits are enforced per API key, in three buckets: `read` (100 requests/second, every
+    `GET`), `write` (25 requests/second, every other `POST`/`PATCH`/`DELETE`), and `ai` (10
+    requests/minute, for the handful of LLM-backed endpoints: `attributes.create` with
+    `requirements`, `segments.create`, `segments.update` with `requirements`,
+    `webhooks.create`/`webhooks.update` with a `custom filter` condition, and
+    `broadcasts.generateAudience`). Exceeding a limit returns `429` with a `Retry-After` header
+    (an HTTP date, UTC).
+
+
+    Beyond the usual 200/201/400/401/403/404/409/422/429/500, four status codes appear on this
+    surface: `402` payment required (`insufficient_credits` on an AI-generation call or a
+    schema with AI auto-fill; `email_limit_reached` on `templates.send`); `405` method not
+    allowed (`events_immutable`, events cannot be edited or deleted, fire a new one); `413`
+    payload too large (`payload_too_large`, request body over 10 MB); `415` unsupported media
+    type (`unsupported_media_type`). `400` also covers `malformed_json` (body is not valid JSON)
+    and, on paginated list endpoints, `offset_too_large` (an `offset` past the pagination cap).
+
+
+    Mutating requests on select endpoints (noted per operation below) accept an
+    `Idempotency-Key` header to make retries safe: the first request with a given key claims and
+    executes normally; a retry while the original is still in flight returns `409
+    idempotency_conflict` (unless the pending claim is older than 60 seconds, in which case it is
+    treated as abandoned); a retry after the original completed replays the original status and
+    body verbatim with an `Idempotent-Replay: true` response header. A `5xx` response is never
+    cached. Records expire after 24 hours. Secret-returning creates (`apiKeys.create`,
+    `webhooks.create`, `webhooks.rotateSecret`) deliberately do not support it, since replaying
+    the cached response would re-expose the plaintext secret.
   contact:
     name: maxclicks
     url: https://maxclicks.ai
@@ -42,21 +72,35 @@ tags:
   - name: Meta
     description: Identify the calling API key.
   - name: Schemas
-    description: Read the space's schemas (contact, object, event).
+    description: Manage the space's schemas (contact, object, event).
   - name: Attributes
-    description: Read a schema's attributes.
+    description: Read or add a schema's attributes.
   - name: Records
     description: Create, read, update, and delete contact and object records.
+  - name: Imports
+    description: Bulk-import contact and object records from a CSV file.
   - name: Suppressions
     description: Manage the email do-not-contact list. Requires an admin key.
   - name: Events
     description: Fire trigger events and read them back.
+  - name: Domains
+    description: Manage sending domains. Most endpoints require an admin key.
+  - name: Senders
+    description: Manage saved sender profiles.
+  - name: Topics
+    description: Manage communication topics.
+  - name: Segments
+    description: Generate and manage AI-defined contact filters.
+  - name: Broadcasts
+    description: Create, schedule, and send mass emails to a contact audience.
   - name: Templates
-    description: Send stored message templates.
+    description: Manage and send stored message templates.
   - name: Webhooks
     description: Manage outgoing webhooks.
   - name: Workflows
-    description: Trigger workflows through incoming-webhook steps.
+    description: Trigger workflows and inspect their runs.
+  - name: API Keys
+    description: Self-service API key management. Requires an admin key.
   - name: Forms
     description: Public form submission and double opt-in confirmation.
   - name: Emails
@@ -119,8 +163,45 @@ paths:
                     items: { $ref: '#/components/schemas/Schema' }
                   pagination: { $ref: '#/components/schemas/Pagination' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Schemas]
+      summary: Create a schema
+      description: >
+        Creates a contact, object, or event schema. Supports `Idempotency-Key`.
+        Errors: `invalid_schema`, `schema_name_reserved` (400, a reserved platform
+        name), `schema_name_conflict` (409, name or slug already used in this space).
+      operationId: schemas.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SchemaCreate' }
+      responses:
+        '201':
+          description: The created schema.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Schema' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -146,6 +227,62 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    patch:
+      tags: [Schemas]
+      summary: Update a schema
+      description: >
+        Partially updates `name`/`namePlural`/`description`. `type` and `slug` are
+        immutable (`400 schema_immutable_field` if a change is attempted). Errors:
+        `schema_not_found`, `schema_name_conflict` (409), `schema_integration_owned`
+        (403), `schema_name_reserved`, `invalid_schema`.
+      operationId: schemas.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SchemaUpdate' }
+      responses:
+        '200':
+          description: The updated schema.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Schema' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Schemas]
+      summary: Delete a schema
+      description: >
+        Hard-deletes a schema and cascades its records. Errors: `schema_not_found`,
+        `schema_integration_owned` (403), `schema_in_use` (409, it is the evaluation
+        target of another schema's evaluated attribute, or is referenced by
+        attributes, segments, broadcasts, workflow steps, or webhooks),
+        `last_contact_schema` (409, it is the only contact schema in the space).
+      operationId: schemas.delete
+      responses:
+        '200':
+          description: The schema was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -177,6 +314,44 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Attributes]
+      summary: Create an attribute
+      description: >
+        Adds a custom attribute to the schema: either a stored attribute (via
+        `definition`) or an AI-generated evaluated attribute (via a natural-language
+        `requirements` prompt; credits are checked first, and this call falls in the
+        `ai` rate bucket). The generated expression is never returned. Errors:
+        `schema_not_found`, `invalid_attribute`, `attribute_key_conflict` (409),
+        `attribute_generation_failed` (422), `insufficient_credits` (402).
+      operationId: attributes.create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttributeCreate' }
+      responses:
+        '201':
+          description: The created attribute.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Attribute' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -234,6 +409,7 @@ paths:
                     items: { $ref: '#/components/schemas/Record' }
                   pagination: { $ref: '#/components/schemas/Pagination' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -244,8 +420,13 @@ paths:
       summary: Create a record
       description: >
         Strictly creates one contact or object record (never updates an existing
-        one). Any `id` in the body is ignored. `source` is forced to `api`.
+        one). Any `id` in the body is ignored. `source` is forced to `api`. If the
+        schema has an AI auto-fill attribute, credits are checked first. Supports
+        `Idempotency-Key`. Errors: `schema_not_found`, `identifier_conflict` (409),
+        `insufficient_credits` (402).
       operationId: records.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
       requestBody:
         required: true
         content:
@@ -254,14 +435,19 @@ paths:
       responses:
         '201':
           description: The created record.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecordEnvelope' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -275,8 +461,13 @@ paths:
         Creates or updates a record by identity. Contact match cascade is
         id, then userId, then email, then phone; object match is id, then
         externalId. Per-field identifier conflicts are reverted and reported in
-        `warnings`. Returns 201 when created, 200 when updated.
+        `warnings`. Returns 201 when created, 200 when updated. Same AI auto-fill
+        credit check as create. Supports `Idempotency-Key`. Errors:
+        `schema_not_found`, `record_not_found` (404, an explicit `id` matched no
+        record), `insufficient_credits` (402).
       operationId: records.upsert
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
       requestBody:
         required: true
         content:
@@ -285,18 +476,25 @@ paths:
       responses:
         '200':
           description: The updated record.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecordEnvelope' }
         '201':
           description: The created record.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecordEnvelope' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -322,7 +520,10 @@ paths:
     patch:
       tags: [Records]
       summary: Update a record
-      description: Partially updates a record. An explicit null clears a nullable field.
+      description: >
+        Partially updates a record. An explicit null clears a nullable field.
+        Does not run the AI auto-fill credit check that create/upsert do.
+        Errors: `schema_not_found`, `record_not_found`, `identifier_conflict` (409).
       operationId: records.update
       requestBody:
         required: true
@@ -340,6 +541,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
     delete:
@@ -365,7 +568,9 @@ paths:
     get:
       tags: [Records]
       summary: List a contact's audit trail
-      description: Lists the consent and communication audit trail for a contact, newest first.
+      description: >
+        Lists the consent and communication audit trail for a contact, newest
+        first. Contact schemas only. Errors: `schema_not_found`, `record_not_found`.
       operationId: records.auditTrail
       parameters:
         - name: channel
@@ -395,11 +600,194 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
+  /schemas/{schema}/imports:
+    parameters:
+      - { $ref: '#/components/parameters/SchemaParam' }
+    get:
+      tags: [Imports]
+      summary: List imports
+      operationId: imports.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of imports.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Import' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Imports]
+      summary: Create an import
+      description: >
+        Starts an asynchronous import of contact or object records from an
+        already-uploaded CSV file (a reference by URL, not inline records or raw
+        CSV text). Contact and object schemas only; event schemas and
+        integration-owned schemas are rejected. Supports `Idempotency-Key`. Errors:
+        `schema_not_found`, `schema_integration_owned` (403),
+        `schema_type_not_supported` (400, an event schema), `invalid_file_url`,
+        `invalid_import`, `import_file_too_large` (400, file over 50 MB).
+      operationId: imports.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportCreate' }
+      responses:
+        '202':
+          description: The import was accepted and is processing.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Import' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /imports/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/ImportIdParam' }
+    get:
+      tags: [Imports]
+      summary: Get an import
+      operationId: imports.get
+      responses:
+        '200':
+          description: The import.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Import' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /imports/{id}/failure-log:
+    parameters:
+      - { $ref: '#/components/parameters/ImportIdParam' }
+    get:
+      tags: [Imports]
+      summary: Download an import's failure log
+      description: >
+        Streams the failure CSV directly (`Content-Type: text/csv`,
+        `Content-Disposition: attachment`), not the `{data}` envelope. Same
+        bearer API-key auth as every other endpoint here. Errors:
+        `import_not_found`, `import_failure_log_not_found`.
+      operationId: imports.downloadFailureLog
+      responses:
+        '200':
+          description: The failure-row CSV.
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /imports/{id}/cancel:
+    parameters:
+      - { $ref: '#/components/parameters/ImportIdParam' }
+    post:
+      tags: [Imports]
+      summary: Cancel an import
+      description: >
+        Cancels a pending or running import. Errors: `import_not_found`,
+        `import_not_cancelable` (409, the import already finished).
+      operationId: imports.cancel
+      responses:
+        '200':
+          description: The canceled import.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Import' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
   /contacts/suppressions:
+    get:
+      tags: [Suppressions]
+      summary: List suppressions
+      description: >
+        Lists suppressions for the caller's space, newest first. Includes global
+        suppressions (not space-scoped) alongside space-scoped ones, since both
+        block sends to the caller's contacts. Requires an admin key.
+      operationId: suppressions.list
+      parameters:
+        - name: identifier
+          in: query
+          required: false
+          description: Filter to the suppression(s) for one email address.
+          schema: { type: string, format: email }
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of suppressions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Suppression' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
     post:
       tags: [Suppressions]
       summary: Create a suppression
-      description: Suppresses an email identifier for the space. Requires an admin key.
+      description: >
+        Suppresses an email identifier for the space. Requires an admin key. Not
+        Idempotency-Key aware. Error: `suppression_already_exists` (409; `manual`
+        and `legal` are distinct reasons).
       operationId: suppressions.create
       requestBody:
         required: true
@@ -421,20 +809,119 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /contacts/suppressions/batch:
+    post:
+      tags: [Suppressions]
+      summary: Batch-create suppressions
+      description: >
+        Bulk-creates 1 to 100 suppressions in one call. Each item is validated and
+        processed independently: an existing suppression for the same identifier
+        and reason returns `exists` rather than failing the item. Requires an
+        admin key. Supports `Idempotency-Key`. Always responds `200`.
+      operationId: suppressions.batchCreate
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SuppressionBatchCreateRequest' }
+      responses:
+        '200':
+          description: Per-item results and a summary.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/SuppressionBatchCreateResult' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /contacts/suppressions/batch-remove:
+    post:
+      tags: [Suppressions]
+      summary: Batch-delete suppressions
+      description: >
+        Bulk-removes 1 to 100 suppressions by id in one call. Each id is gated
+        exactly like the single delete (must belong to the caller's space; reason
+        must be `manual` or `legal`). Requires an admin key. Supports
+        `Idempotency-Key`. Always responds `200`.
+      operationId: suppressions.batchDelete
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SuppressionBatchDeleteRequest' }
+      responses:
+        '200':
+          description: Per-item results and a summary.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/SuppressionBatchDeleteResult' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
   /contacts/suppressions/{id}:
     parameters:
-      - name: id
-        in: path
-        required: true
-        description: The suppression id.
-        schema: { type: string }
+      - { $ref: '#/components/parameters/SuppressionIdParam' }
+    get:
+      tags: [Suppressions]
+      summary: Get a suppression
+      description: "Requires an admin key. Error: `suppression_not_found`."
+      operationId: suppressions.get
+      responses:
+        '200':
+          description: The suppression.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Suppression' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
     delete:
       tags: [Suppressions]
       summary: Delete a suppression
-      description: Removes a suppression, re-allowing communication to that identifier. Requires an admin key.
+      description: >
+        Removes a suppression, re-allowing communication to that identifier.
+        Requires an admin key. Not Idempotency-Key aware. Errors:
+        `suppression_not_found`, `suppression_reason_not_removable` (403, a
+        system-applied reason such as a hard bounce, not `manual`/`legal`).
       operationId: suppressions.delete
       responses:
         '200':
@@ -448,14 +935,85 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
+  /events:
+    get:
+      tags: [Events]
+      summary: List events
+      description: >
+        Cursor-paginated event history for one event schema, newest first, read
+        through the ClickHouse-backed archive (so it sees every event ever fired,
+        not just ones that triggered backend processing). `from`/`to` default to
+        the 7 days before now when omitted; a wider span than
+        `config.publicApi.maximumEventListRangeDays` (90 days) is silently clamped
+        with a warning, not rejected. This endpoint uses the distinct cursor
+        pagination envelope, not the offset envelope used elsewhere in v1: there
+        is no `offset` parameter and no `totalCount`. Errors: `schema_not_found`,
+        `invalid_cursor`, `invalid_time_range`, `event_archive_unavailable` (502).
+      operationId: events.list
+      parameters:
+        - name: schema
+          in: query
+          required: true
+          description: The event schema id or slug.
+          schema: { type: string }
+        - name: from
+          in: query
+          required: false
+          description: Start of the time range (ISO 8601). Defaults to 7 days before `to`.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: false
+          description: End of the time range (ISO 8601). Defaults to now.
+          schema: { type: string, format: date-time }
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor from a previous page's `pagination.nextCursor`.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: Page size. Defaults to 50, capped at 200.
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        '200':
+          description: A cursor page of events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Event' }
+                  pagination: { $ref: '#/components/schemas/CursorPagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '502': { $ref: '#/components/responses/IngestUnavailable' }
+
   /events/{schema}:
+    x-note: >
+      OpenAPI templates `/events/{schema}` (fire) and `/events/{id}` (get one) as the same path
+      shape, so this path item merges both under one templated path with `post` and `get`,
+      mirroring how the server dispatches them by method. The wire URLs are unchanged.
+      `PATCH`/`DELETE /events/{id}` always return `405 events_immutable` ("Events are immutable.
+      Fire a new event instead."), a deliberate guard, not a real operation, and not modeled here.
     post:
       tags: [Events]
       summary: Fire an event
       description: >
         Fires a single event of the given event schema. Asynchronous fire and
         forget: the event is handed to the ingest pipeline and 202 is returned
-        with the accepted count. The body is the flat event input.
+        with the accepted count. The body is the flat event input. Not
+        Idempotency-Key aware; dedupe with your own `eventId` instead. Errors:
+        `schema_not_found`, `ingest_unavailable` (502).
       operationId: events.fire
       parameters:
         - name: schema
@@ -483,12 +1041,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '502': { $ref: '#/components/responses/IngestUnavailable' }
     get:
       tags: [Events]
       summary: Get an event
-      description: Fetches one previously-fired event by its platform id.
+      description: >
+        Fetches one previously-fired event by its platform id. Falls back to the
+        ClickHouse-backed archive when there is no operational row (an event whose
+        schema was never demanded is archived but has no operational row).
       operationId: events.get
       parameters:
         - name: schema
@@ -512,6 +1075,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        '502': { $ref: '#/components/responses/IngestUnavailable' }
 
   /events/{schema}/batch:
     parameters:
@@ -521,9 +1085,12 @@ paths:
       summary: Fire a batch of events
       description: >
         Fires up to 500 events of one schema. With `onError: continue` (the
-        default) every valid item is queued and 200 is returned. With
-        `onError: abort` the batch stops at the first invalid item and returns
-        422 with `failedIndex`.
+        default) every item is validated, the whole valid subset is handed to the
+        ingest pipeline in one call, and 200 is returned with per-item results;
+        if that single ingest call itself fails, the whole request fails `502
+        ingest_unavailable` rather than a partial success. With `onError: abort`
+        the batch stops at the first invalid item, ingests nothing, and returns
+        422 with `failedIndex`. Not Idempotency-Key aware.
       operationId: events.fireBatch
       requestBody:
         required: true
@@ -541,6 +1108,12 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/BatchFireResult' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '422':
           description: The batch aborted on the first invalid item.
           content:
@@ -551,12 +1124,1098 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/BatchFireResult' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '502': { $ref: '#/components/responses/IngestUnavailable' }
+
+  /domains:
+    get:
+      tags: [Domains]
+      summary: List domains
+      description: Items omit `records` (unlike get/create/verify); call `domains.get` for DNS records.
+      operationId: domains.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of domains.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Domain' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Domains]
+      summary: Add a domain
+      description: >
+        Synchronously provisions AWS SES resources and returns the DNS records to
+        add. Requires an admin key. Supports `Idempotency-Key`. Errors:
+        `invalid_domain`, `domain_already_added` (409), `domain_limit_reached`
+        (409, 20 domains per space), `domain_unavailable` (409, already in use by
+        another space).
+      operationId: domains.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DomainCreate' }
+      responses:
+        '201':
+          description: The created domain, with its DNS records.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Domain' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /domains/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/DomainIdParam' }
+    get:
+      tags: [Domains]
+      summary: Get a domain
+      description: "Includes live-checked `records`. Error: `domain_not_found`."
+      operationId: domains.get
+      responses:
+        '200':
+          description: The domain.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Domain' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-        '502': { $ref: '#/components/responses/IngestUnavailable' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Domains]
+      summary: Delete a domain
+      description: >
+        Best-effort tears down the AWS SES resources after the DB delete commits.
+        Requires an admin key. If this was the space's default domain, a new
+        default is auto-selected. Error: `domain_not_found`.
+      operationId: domains.delete
+      responses:
+        '200':
+          description: The domain was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /domains/{id}/verify:
+    parameters:
+      - { $ref: '#/components/parameters/DomainIdParam' }
+    post:
+      tags: [Domains]
+      summary: Verify a domain
+      description: >
+        Live-checks AWS SES and DNS and syncs `verifiedForSending`; on the first
+        call also flips `verificationStarted` to true. Same response shape as
+        get. Error: `domain_not_found`.
+      operationId: domains.verify
+      responses:
+        '200':
+          description: The domain, with refreshed verification state and DNS records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Domain' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /senders:
+    get:
+      tags: [Senders]
+      summary: List senders
+      operationId: senders.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of senders.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Sender' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Senders]
+      summary: Create a sender
+      description: >
+        Creates a saved sender profile. Only checks that `domainId` belongs to the
+        caller's space; the domain does not need to be verified yet. Supports
+        `Idempotency-Key`. Errors: `invalid_sender`, `domain_not_found`,
+        `duplicate_sender` (409, same resulting email address).
+      operationId: senders.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SenderCreate' }
+      responses:
+        '201':
+          description: The created sender.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Sender' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /senders/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/SenderIdParam' }
+    get:
+      tags: [Senders]
+      summary: Get a sender
+      description: "Error: `sender_not_found`."
+      operationId: senders.get
+      responses:
+        '200':
+          description: The sender.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Sender' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    patch:
+      tags: [Senders]
+      summary: Update a sender
+      description: >
+        Partial update. Re-validates domain ownership whenever `code` or
+        `domainId` changes. Errors: `sender_not_found`, `invalid_sender`,
+        `domain_not_found`, `duplicate_sender` (409).
+      operationId: senders.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SenderUpdate' }
+      responses:
+        '200':
+          description: The updated sender.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Sender' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Senders]
+      summary: Delete a sender
+      description: "Error: `sender_not_found`."
+      operationId: senders.delete
+      responses:
+        '200':
+          description: The sender was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /topics:
+    get:
+      tags: [Topics]
+      summary: List topics
+      operationId: topics.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of topics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Topic' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Topics]
+      summary: Create a topic
+      description: >
+        `channel` defaults to, and today only supports, `email`. Supports
+        `Idempotency-Key`. Errors: `invalid_topic`, `topic_name_conflict` (409,
+        same name within the channel).
+      operationId: topics.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TopicCreate' }
+      responses:
+        '201':
+          description: The created topic.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Topic' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /topics/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/TopicIdParam' }
+    get:
+      tags: [Topics]
+      summary: Get a topic
+      description: "Error: `topic_not_found`."
+      operationId: topics.get
+      responses:
+        '200':
+          description: The topic.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Topic' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    patch:
+      tags: [Topics]
+      summary: Update a topic
+      description: >
+        Partial update. `channel` is immutable (`400 topic_immutable_field` if a
+        change is attempted). Errors: `topic_not_found`, `invalid_topic`,
+        `topic_name_conflict` (409).
+      operationId: topics.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TopicUpdate' }
+      responses:
+        '200':
+          description: The updated topic.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Topic' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Topics]
+      summary: Delete a topic
+      description: >
+        Query `?force=true` bypasses the in-use check. Errors: `topic_not_found`,
+        `topic_in_use` (409, referenced by a form or email template unless forced).
+      operationId: topics.delete
+      parameters:
+        - name: force
+          in: query
+          required: false
+          description: Bypass the in-use check.
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: The topic was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /segments:
+    get:
+      tags: [Segments]
+      summary: List segments
+      operationId: segments.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of segments.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Segment' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Segments]
+      summary: Create a segment
+      description: >
+        Generates a contact filter from a natural-language `requirements` prompt
+        (every create is an AI call, in the `ai` rate bucket; credits are checked
+        first) and persists it in one call. The response includes a live
+        `matchingCount`. The generated expression is never returned. Errors:
+        `schema_not_found`, `invalid_segment`, `segment_generation_failed` (422),
+        `segment_name_conflict` (409), `insufficient_credits` (402).
+      operationId: segments.create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SegmentCreate' }
+      responses:
+        '201':
+          description: The created segment.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Segment' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /segments/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/SegmentIdParam' }
+    get:
+      tags: [Segments]
+      summary: Get a segment
+      description: "Error: `segment_not_found`."
+      operationId: segments.get
+      responses:
+        '200':
+          description: The segment.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Segment' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    patch:
+      tags: [Segments]
+      summary: Update a segment
+      description: >
+        `name`/`description` update freely. Supplying `requirements` regenerates
+        the condition (an AI call, in the `ai` rate bucket) and is rejected with
+        `409 segment_in_use` if the segment is referenced by other attributes,
+        segments, broadcasts, workflow steps, or webhooks. Errors:
+        `segment_not_found`, `invalid_segment`, `segment_generation_failed` (422),
+        `segment_name_conflict` (409), `segment_integration_owned` (403),
+        `segment_in_use` (409), `insufficient_credits` (402).
+      operationId: segments.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SegmentUpdate' }
+      responses:
+        '200':
+          description: The updated segment.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Segment' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Segments]
+      summary: Delete a segment
+      description: >
+        Errors: `segment_not_found`, `segment_integration_owned` (403),
+        `segment_in_use` (409, used as a broadcast audience, workflow trigger, or
+        webhook condition, or referenced by other entities).
+      operationId: segments.delete
+      responses:
+        '200':
+          description: The segment was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /segments/{id}/count:
+    parameters:
+      - { $ref: '#/components/parameters/SegmentIdParam' }
+    get:
+      tags: [Segments]
+      summary: Count a segment's matching contacts
+      description: "Error: `segment_not_found`."
+      operationId: segments.count
+      responses:
+        '200':
+          description: The live matching count and the schema's total contact count.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [count, total]
+                    properties:
+                      count: { type: integer, description: Contacts currently matching the segment. }
+                      total: { type: integer, description: All contacts of the segment's schema. }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /segments/{id}/contacts:
+    parameters:
+      - { $ref: '#/components/parameters/SegmentIdParam' }
+    get:
+      tags: [Segments]
+      summary: List a segment's matching contacts
+      description: >
+        Paginated contact records currently matching the segment. `limit` is
+        additionally hard-capped at `config.segment.maximumContactsPageSize` (100)
+        regardless of the requested value. Error: `segment_not_found`.
+      operationId: segments.listContacts
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of matching contacts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ContactRecord' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /broadcasts:
+    get:
+      tags: [Broadcasts]
+      summary: List broadcasts
+      operationId: broadcasts.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of broadcasts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Broadcast' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Broadcasts]
+      summary: Create a broadcast
+      description: >
+        One-shot create: an audience (`all`, the default, or an existing
+        `segment`) and optional inline raw email content (no rich-editor
+        structure: `{ bodyFormat, subject, body }`). A broadcast's content is a
+        1:1 owned copy, not a reference to a reusable `Template`. Supports
+        `Idempotency-Key`. Errors: `invalid_broadcast`, `schema_not_found`,
+        `segment_not_found`, `topic_not_found`, `domain_not_found`,
+        `sender_not_found`.
+      operationId: broadcasts.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BroadcastCreate' }
+      responses:
+        '201':
+          description: The created broadcast.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Broadcast' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /broadcasts/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/BroadcastIdParam' }
+    get:
+      tags: [Broadcasts]
+      summary: Get a broadcast
+      description: "Error: `broadcast_not_found`."
+      operationId: broadcasts.get
+      responses:
+        '200':
+          description: The broadcast.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Broadcast' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    patch:
+      tags: [Broadcasts]
+      summary: Update a broadcast
+      description: >
+        Only `name`/`description`/`audience`/`scheduledFor` are updatable.
+        `schedulingStatus` only ever changes through `POST /:id/send`. Rejected
+        once sending has started. Errors: `broadcast_not_found`,
+        `broadcast_already_sending` (409), `invalid_broadcast`, `segment_not_found`.
+      operationId: broadcasts.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BroadcastUpdate' }
+      responses:
+        '200':
+          description: The updated broadcast.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Broadcast' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Broadcasts]
+      summary: Delete a broadcast
+      description: >
+        Hard delete, cascades runs. Errors: `broadcast_not_found`,
+        `broadcast_sending` (409, currently mid-send).
+      operationId: broadcasts.delete
+      responses:
+        '200':
+          description: The broadcast was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /broadcasts/{id}/send:
+    parameters:
+      - { $ref: '#/components/parameters/BroadcastIdParam' }
+    post:
+      tags: [Broadcasts]
+      summary: Send a broadcast
+      description: >
+        Moves the broadcast to `send now` (or `send at` when `scheduledFor` is
+        given), gated by the same readiness checks the app runs before letting a
+        broadcast schedule (missing content, missing sender, etc.). On success the
+        broadcast is picked up by the sending pipeline; sending itself is
+        asynchronous. Errors: `broadcast_not_found`, `broadcast_already_sending`
+        (409), `invalid_broadcast`, `broadcast_invalid` (422, readiness gate,
+        carries `issues[]`).
+      operationId: broadcasts.send
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BroadcastSendRequest' }
+      responses:
+        '202':
+          description: The broadcast was accepted for sending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Broadcast' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /broadcasts/{id}/audience/generate:
+    parameters:
+      - { $ref: '#/components/parameters/BroadcastIdParam' }
+    post:
+      tags: [Broadcasts]
+      summary: Generate a custom-filter audience
+      description: >
+        Generates and persists a `custom filter` audience from a natural-language
+        `requirements` prompt (an AI call, in the `ai` rate bucket; credits are
+        checked first). The generated expression is never returned; only the
+        description and a live `matchingCount`. Rejected once sending has
+        started. Errors: `broadcast_not_found`, `broadcast_already_sending` (409),
+        `invalid_broadcast`, `audience_generation_failed` (422),
+        `insufficient_credits` (402).
+      operationId: broadcasts.generateAudience
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BroadcastAudienceGenerateRequest' }
+      responses:
+        '200':
+          description: The generated audience and its live matching count.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/BroadcastAudienceGenerateResponse' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /broadcasts/{id}/runs:
+    parameters:
+      - { $ref: '#/components/parameters/BroadcastIdParam' }
+    get:
+      tags: [Broadcasts]
+      summary: List a broadcast's runs
+      description: "One reduced run record per recipient contact. Error: `broadcast_not_found`."
+      operationId: broadcasts.listRuns
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of broadcast runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/BroadcastRun' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /broadcasts/{id}/metrics:
+    parameters:
+      - { $ref: '#/components/parameters/BroadcastIdParam' }
+    get:
+      tags: [Broadcasts]
+      summary: Get a broadcast's aggregated email metrics
+      description: >
+        `email` is omitted entirely when the broadcast has no email content yet.
+        Error: `broadcast_not_found`.
+      operationId: broadcasts.getMetrics
+      responses:
+        '200':
+          description: Aggregated send/open/click/bounce metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/BroadcastMetricsResponse' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /templates:
+    get:
+      tags: [Templates]
+      summary: List templates
+      operationId: templates.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of templates.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Template' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Templates]
+      summary: Create a template
+      description: >
+        Creates a template with raw editor content only (creation is not an AI
+        operation). Supports `Idempotency-Key`. Errors: `invalid_template`,
+        `invalid_content`, `topic_not_found`, `domain_not_found`,
+        `sender_not_found`.
+      operationId: templates.create
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateCreate' }
+      responses:
+        '201':
+          description: The created template.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Template' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /templates/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/TemplateIdParam' }
+    get:
+      tags: [Templates]
+      summary: Get a template
+      description: "Error: `template_not_found`."
+      operationId: templates.get
+      responses:
+        '200':
+          description: The template.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Template' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    patch:
+      tags: [Templates]
+      summary: Update a template
+      description: >
+        Partial update. Errors: `template_not_found`, `invalid_template`,
+        `invalid_content`, `topic_not_found`, `domain_not_found`,
+        `sender_not_found`.
+      operationId: templates.update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateUpdate' }
+      responses:
+        '200':
+          description: The updated template.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Template' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Templates]
+      summary: Delete a template
+      description: "Error: `template_not_found`."
+      operationId: templates.delete
+      responses:
+        '200':
+          description: The template was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /templates/{id}/duplicate:
+    parameters:
+      - { $ref: '#/components/parameters/TemplateIdParam' }
+    post:
+      tags: [Templates]
+      summary: Duplicate a template
+      description: "No body. Supports `Idempotency-Key`. Error: `template_not_found`."
+      operationId: templates.duplicate
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+      responses:
+        '201':
+          description: The duplicated template.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Template' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
 
   /templates/{templateId}/send:
     parameters:
@@ -569,10 +2228,21 @@ paths:
       tags: [Templates]
       summary: Send a template
       description: >
-        Renders and sends a template to the recipient resolved from `data`. The
-        send is synchronous. The response body is an empty object; any warnings
-        are returned in the `maxclicks-Warning-Message` response header.
+        Renders and sends a template to the recipient resolved from `data`
+        (validated against the template's `expectedDataRepresentation`; records
+        referenced by `data` are upserted as a side effect before rendering). The
+        send is synchronous. Warnings are returned in the body's `warnings` array.
+        Supports `Idempotency-Key`. Pre-send validation/eligibility failures throw
+        as request errors, not as a `200` with `status: failed`:
+        `email_limit_reached` (402), `sending_disabled` (422),
+        `template_not_sendable` (400), `domain_not_verified` (422), `invalid_data`
+        (400), `marketing_requires_contact` (422), `recipient_not_subscribed`
+        (422), `recipient_suppressed` (422). A genuine SES send failure instead
+        returns `200` with `status: "failed"` and a generic `error` message (the
+        real failure detail stays server-side).
       operationId: templates.send
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
       requestBody:
         required: true
         content:
@@ -582,18 +2252,24 @@ paths:
         '200':
           description: The send was processed.
           headers:
-            maxclicks-Warning-Message:
-              description: URL-encoded, newline-joined warnings, when any were produced.
-              schema: { type: string }
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
           content:
             application/json:
               schema:
                 type: object
-                description: An empty object.
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/TemplateSendResponse' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
   /webhooks:
@@ -627,7 +2303,13 @@ paths:
       summary: Create a webhook
       description: >
         Creates a webhook. The response includes `signatureVerificationSecret`,
-        which is shown here and on rotate-secret only. Save it immediately.
+        which is shown here and on rotate-secret only. Save it immediately. A
+        `custom filter` condition generates via AI (in the `ai` rate bucket;
+        credits are checked first) and stores only its human-readable
+        description; the generated expression is never returned. Not
+        Idempotency-Key aware (a secret-returning create). Errors:
+        `invalid_webhook`, `schema_not_found`, `segment_not_found`,
+        `webhook_filter_generation_failed` (422), `insufficient_credits` (402).
       operationId: webhooks.create
       requestBody:
         required: true
@@ -647,8 +2329,12 @@ paths:
                   warnings: { $ref: '#/components/schemas/Warnings' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -678,7 +2364,13 @@ paths:
     patch:
       tags: [Webhooks]
       summary: Update a webhook
-      description: Updates url, email event types, condition, and/or status. Trigger and schema are not updatable.
+      description: >
+        Updates url, email event types, condition, and/or status. Trigger and
+        schema are not updatable (`400 webhook_immutable_field`). Regenerating a
+        `custom filter` condition is an AI call (in the `ai` rate bucket). Errors:
+        `webhook_not_found`, `webhook_integration_owned` (403), `invalid_webhook`,
+        `webhook_immutable_field`, `segment_not_found`,
+        `webhook_filter_generation_failed` (422), `insufficient_credits` (402).
       operationId: webhooks.update
       requestBody:
         required: true
@@ -698,13 +2390,18 @@ paths:
                   warnings: { $ref: '#/components/schemas/Warnings' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
     delete:
       tags: [Webhooks]
       summary: Delete a webhook
+      description: "Errors: `webhook_not_found`, `webhook_integration_owned` (403)."
       operationId: webhooks.delete
       responses:
         '200':
@@ -724,7 +2421,10 @@ paths:
     post:
       tags: [Webhooks]
       summary: Rotate a webhook secret
-      description: Generates a new signing secret and returns it. The old secret stops verifying immediately.
+      description: >
+        Generates a new signing secret and returns it. The old secret stops
+        verifying immediately. Not Idempotency-Key aware (secret-returning).
+        Errors: `webhook_not_found`, `webhook_integration_owned` (403).
       operationId: webhooks.rotateSecret
       responses:
         '200':
@@ -743,23 +2443,113 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
-  /workflows/{workflowStepReference}:
-    parameters:
-      - name: workflowStepReference
-        in: path
-        required: true
-        description: The incoming-webhook step's reference id.
-        schema: { type: string }
+  /workflows:
+    get:
+      tags: [Workflows]
+      summary: List workflows
+      operationId: workflows.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of workflows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Workflow' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /workflows/{id}:
+    x-note: >
+      This path also serves `POST /workflows/{workflowStepReference}` (workflows.trigger),
+      registered on the router as a catch-all single-segment POST beneath the more specific
+      routes (list/get/pause/unpause/delete/runs). OpenAPI models both under one templated
+      path item, matching the `/events/{schema}` merge above.
+    get:
+      tags: [Workflows]
+      summary: Get a workflow
+      description: "Error: `workflow_not_found`."
+      operationId: workflows.get
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The workflow id.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The workflow.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Workflow' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      tags: [Workflows]
+      summary: Delete a workflow
+      description: "Hard delete. Error: `workflow_not_found`."
+      operationId: workflows.delete
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The workflow id.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The workflow was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
     post:
       tags: [Workflows]
       summary: Trigger a workflow
       description: >
-        Starts a workflow run from an incoming-webhook step. The body is
-        arbitrary JSON validated server-side against the step's configured JSON
-        schema. On success returns an empty object. Note: failures from the
-        workflow handler are returned as `text/plain`, while authentication
-        failures use the JSON error envelope.
+        Starts a workflow run from a published incoming-webhook step. The
+        path segment is the step's `workflowStepReference`, not a workflow id
+        (this is the router's catch-all trigger route; see the note on this path
+        item). The body is arbitrary JSON validated server-side against the
+        step's configured JSON schema. On success returns an empty object. Read
+        permission only (intentionally, despite the write side effects). Supports
+        `Idempotency-Key`, the recommended way to make retried external webhook
+        deliveries safe. Note: failures from the workflow handler are returned as
+        `text/plain`, while authentication failures use the JSON error envelope.
+        Errors: `workflow_step_not_found` (404, covers a missing/duplicate/
+        unpublished step and a paused workflow, indistinguishable from
+        not-found here), `invalid_request_body` (400, body fails the step's JSON
+        schema).
       operationId: workflows.trigger
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The incoming-webhook step's reference id.
+          schema: { type: string }
+        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
       requestBody:
         required: true
         content:
@@ -771,11 +2561,17 @@ paths:
       responses:
         '200':
           description: The workflow run was started.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
           content:
             application/json:
               schema:
                 type: object
-                description: An empty object.
+                required: [data]
+                description: "`data` is an empty object."
+                properties:
+                  data: { type: object }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
         '400':
           description: The body failed the step's JSON schema, or the schema is invalid.
           content:
@@ -788,11 +2584,206 @@ paths:
           content:
             text/plain:
               schema: { type: string }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '500':
           description: Server error.
           content:
             text/plain:
               schema: { type: string }
+
+  /workflows/{id}/pause:
+    parameters:
+      - { $ref: '#/components/parameters/WorkflowIdParam' }
+    post:
+      tags: [Workflows]
+      summary: Pause a workflow
+      description: >
+        Stops new runs from starting; runs already in flight finish normally.
+        Error: `workflow_not_found`.
+      operationId: workflows.pause
+      responses:
+        '200':
+          description: The paused workflow.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Workflow' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /workflows/{id}/unpause:
+    parameters:
+      - { $ref: '#/components/parameters/WorkflowIdParam' }
+    post:
+      tags: [Workflows]
+      summary: Unpause a workflow
+      description: "Error: `workflow_not_found`."
+      operationId: workflows.unpause
+      responses:
+        '200':
+          description: The unpaused workflow.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Workflow' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /workflows/{id}/runs:
+    parameters:
+      - { $ref: '#/components/parameters/WorkflowIdParam' }
+    get:
+      tags: [Workflows]
+      summary: List a workflow's runs
+      description: "Error: `workflow_not_found`."
+      operationId: workflows.listRuns
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of workflow runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkflowRun' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /workflows/{id}/runs/{runId}:
+    parameters:
+      - { $ref: '#/components/parameters/WorkflowIdParam' }
+      - name: runId
+        in: path
+        required: true
+        description: The workflow run id.
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Workflows]
+      summary: Get a workflow run
+      description: "Errors: `workflow_not_found`, `workflow_run_not_found`."
+      operationId: workflows.getRun
+      responses:
+        '200':
+          description: The workflow run.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/WorkflowRun' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api-keys:
+    get:
+      tags: [API Keys]
+      summary: List API keys
+      description: Requires an admin key.
+      operationId: apiKeys.list
+      parameters:
+        - { $ref: '#/components/parameters/LimitParam' }
+        - { $ref: '#/components/parameters/OffsetParam' }
+      responses:
+        '200':
+          description: A page of API keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ApiKey' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [API Keys]
+      summary: Create an API key
+      description: >
+        Returns the plaintext key, shown exactly once; only `keyDisplay` (a
+        masked preview) is ever returned again. Requires an admin key. Not
+        Idempotency-Key aware (secret-returning). Error: `invalid_api_key_name`.
+      operationId: apiKeys.create
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiKeyCreate' }
+      responses:
+        '201':
+          description: The created API key, including its plaintext value.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/ApiKeyWithSecret' }
+                  warnings: { $ref: '#/components/schemas/Warnings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api-keys/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/ApiKeyIdParam' }
+    delete:
+      tags: [API Keys]
+      summary: Delete an API key
+      description: "Requires an admin key. Error: `api_key_not_found`."
+      operationId: apiKeys.delete
+      responses:
+        '200':
+          description: The API key was deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
 
   /forms/{formId}/submit:
     parameters:
@@ -801,9 +2792,14 @@ paths:
       tags: [Forms]
       summary: Submit a form
       description: >
-        Public, unauthenticated form submission. Validates required fields,
-        CAPTCHA, and consent, then upserts the contact or (for double opt-in)
-        stores a pending record and emails a confirmation link.
+        Public, unauthenticated form submission (the tenant is derived from the
+        form, not an API key). Validates required fields, CAPTCHA, and consent,
+        then upserts the contact or (for double opt-in, when the visitor opted in
+        to email) stores a pending record and emails a confirmation link. A
+        declined-consent submission always goes through the direct path even on a
+        double opt-in form. Rate limits: per IP 10/60s and per form 120/60s (both
+        fail open if Redis is down), plus a separate per-recipient/per-form cap on
+        confirmation emails. Error: `rate_limit_exceeded`.
       operationId: forms.submit
       security: []
       requestBody:
@@ -824,6 +2820,8 @@ paths:
                   warnings: { $ref: '#/components/schemas/Warnings' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
 
@@ -841,7 +2839,9 @@ paths:
       description: >
         Public browser navigation target for the double opt-in email link.
         Redeems the token, upserts the confirmed contact, and always redirects
-        (302) to the hosted result page.
+        (302) to the hosted result page. Every failure path (missing/expired
+        token, unpublished form) also redirects to a "failed" landing page rather
+        than returning a JSON error. Same rate limits as `forms.submit`.
       operationId: forms.confirmDoubleOptIn
       security: []
       responses:
@@ -865,7 +2865,7 @@ paths:
       description: >
         Public RFC 8058 one-click unsubscribe target. Unsubscribes the linked
         contact from a topic or the whole email channel, then redirects (302) to
-        the hosted result page.
+        the hosted result page. No rate limit at all on this endpoint.
       operationId: emails.unsubscribeOneClick
       security: []
       requestBody:
@@ -896,7 +2896,15 @@ components:
       scheme: bearer
       description: >
         Your API key sent as a bearer token in the `Authorization` header:
-        `Authorization: Bearer <api_key>`.
+        `Authorization: Bearer <api_key>`. The server also accepts the raw key
+        without the `Bearer ` prefix, but clients should always send `Bearer`.
+
+  headers:
+    IdempotentReplay:
+      description: >
+        Present and `true` when this response was replayed verbatim from a
+        prior request that used the same `Idempotency-Key`.
+      schema: { type: boolean }
 
   parameters:
     LimitParam:
@@ -913,12 +2921,24 @@ components:
       name: offset
       in: query
       required: false
-      description: Rows to skip. Clamped to 0..10000 with a warning if out of range.
+      description: >
+        Rows to skip. Values below 0 are clamped to 0 with a warning. A value
+        above 10000 is rejected outright with `400 offset_too_large` rather than
+        clamped, so a client cannot silently loop forever past the cap; narrow
+        the query instead of paging past it.
       schema:
         type: integer
         default: 0
         minimum: 0
         maximum: 10000
+    IdempotencyKeyParam:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        A client-generated key that makes retries of this request safe. See the
+        Idempotency-Key section of the top-level description.
+      schema: { type: string }
     SchemaParam:
       name: schema
       in: path
@@ -931,11 +2951,71 @@ components:
       required: true
       description: The record's platform id.
       schema: { type: string, format: uuid }
+    ImportIdParam:
+      name: id
+      in: path
+      required: true
+      description: The import id.
+      schema: { type: string, format: uuid }
+    SuppressionIdParam:
+      name: id
+      in: path
+      required: true
+      description: The suppression id.
+      schema: { type: string }
+    DomainIdParam:
+      name: id
+      in: path
+      required: true
+      description: The domain id.
+      schema: { type: string, format: uuid }
+    SenderIdParam:
+      name: id
+      in: path
+      required: true
+      description: The sender id.
+      schema: { type: string, format: uuid }
+    TopicIdParam:
+      name: id
+      in: path
+      required: true
+      description: The topic id.
+      schema: { type: string, format: uuid }
+    SegmentIdParam:
+      name: id
+      in: path
+      required: true
+      description: The segment id.
+      schema: { type: string, format: uuid }
+    BroadcastIdParam:
+      name: id
+      in: path
+      required: true
+      description: The broadcast id.
+      schema: { type: string, format: uuid }
+    TemplateIdParam:
+      name: id
+      in: path
+      required: true
+      description: The template id.
+      schema: { type: string, format: uuid }
     WebhookIdParam:
       name: id
       in: path
       required: true
       description: The webhook id.
+      schema: { type: string, format: uuid }
+    WorkflowIdParam:
+      name: id
+      in: path
+      required: true
+      description: The workflow id.
+      schema: { type: string, format: uuid }
+    ApiKeyIdParam:
+      name: id
+      in: path
+      required: true
+      description: The API key id.
       schema: { type: string, format: uuid }
     FormIdParam:
       name: formId
@@ -946,7 +3026,10 @@ components:
 
   responses:
     BadRequest:
-      description: The request was malformed or failed validation.
+      description: >
+        The request was malformed or failed validation. Also covers
+        `malformed_json` (body is not valid JSON) and, on list endpoints,
+        `offset_too_large`.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -966,7 +3049,23 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Conflict:
-      description: The write conflicts with an existing resource.
+      description: The write conflicts with an existing resource or the resource's current state.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PaymentRequired:
+      description: >
+        Insufficient credits (`insufficient_credits`) for an AI-generation call
+        or a schema with AI auto-fill, or the space's email allowance is
+        exhausted (`email_limit_reached`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnprocessableEntity:
+      description: >
+        The request was well-formed but could not be processed, typically a
+        failed AI-generation call or a readiness gate (which may carry
+        `error.issues`).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -979,8 +3078,22 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: The request body exceeds the 10 MB limit.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnsupportedMediaType:
+      description: The request used an unsupported content type, charset, or content encoding.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     IngestUnavailable:
-      description: The event ingest pipeline is unavailable.
+      description: >
+        A downstream event dependency is unavailable: the ingest pipeline
+        (`ingest_unavailable`, on `events.fire`/`events.fireBatch`) or the
+        ClickHouse-backed event archive (`event_archive_unavailable`, on
+        `events.get`/`events.list`).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -991,22 +3104,30 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
 
   schemas:
+    ErrorObject:
+      type: object
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          enum: [invalid_request_error, api_error]
+        code:
+          type: [string, 'null']
+          description: A stable machine-readable code, or null.
+        message:
+          type: string
+        issues:
+          type: array
+          description: >
+            Present only for validation-gate failures that report more than one
+            distinct problem at once (e.g. `broadcasts.send`'s `broadcast_invalid`).
+          items: { type: string }
+
     Error:
       type: object
       required: [error]
       properties:
-        error:
-          type: object
-          required: [type, code, message]
-          properties:
-            type:
-              type: string
-              enum: [invalid_request_error, api_error]
-            code:
-              type: [string, 'null']
-              description: A stable machine-readable code, or null.
-            message:
-              type: string
+        error: { $ref: '#/components/schemas/ErrorObject' }
 
     Warnings:
       type: array
@@ -1020,6 +3141,17 @@ components:
         limit: { type: integer }
         offset: { type: integer }
         totalCount: { type: integer }
+        hasMore: { type: boolean }
+
+    CursorPagination:
+      type: object
+      description: Cursor pagination envelope, used only by `events.list`.
+      required: [limit, nextCursor, hasMore]
+      properties:
+        limit: { type: integer }
+        nextCursor:
+          type: [string, 'null']
+          description: Opaque cursor for the next page, or null when there are no more rows.
         hasMore: { type: boolean }
 
     Deleted:
@@ -1055,7 +3187,21 @@ components:
       type: string
       enum: [email]
 
+    BadgeColor:
+      type: string
+      description: A display color for tags and topics.
+      enum:
+        [red, orange, amber, yellow, lime, green, emerald, teal, cyan, sky, blue, indigo, violet, purple, fuchsia, pink, rose, zinc]
+
     SuppressionReason:
+      type: string
+      description: >
+        All possible suppression reasons on read. Only `manual` and `legal` can
+        be created or removed through the API; the rest are system-applied
+        (bounce, complaint, unsubscribe) and read-only.
+      enum: [manual, legal, unsubscribed, hard_bounce, soft_bounce_consecutive, spam_complaint]
+
+    SuppressionCreateReason:
       type: string
       enum: [manual, legal]
 
@@ -1113,6 +3259,24 @@ components:
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
 
+    SchemaCreate:
+      type: object
+      required: [type, name, namePlural, slug]
+      properties:
+        type: { $ref: '#/components/schemas/SchemaType' }
+        name: { type: string }
+        namePlural: { type: string }
+        slug: { type: string }
+        description: { type: [string, 'null'] }
+
+    SchemaUpdate:
+      type: object
+      description: At least one field must be provided. `type` and `slug` are immutable.
+      properties:
+        name: { type: string }
+        namePlural: { type: string }
+        description: { type: [string, 'null'] }
+
     AttributeDefinition:
       type: object
       description: >
@@ -1144,6 +3308,23 @@ components:
         integrationVendorName: { type: [string, 'null'] }
         createdAt: { type: [string, 'null'], format: date-time }
         updatedAt: { type: [string, 'null'], format: date-time }
+
+    AttributeCreate:
+      type: object
+      required: [key, label]
+      description: Provide exactly one of `definition` or `requirements`.
+      properties:
+        key: { type: string, description: "1-100 chars, no spaces or quotes, not a reserved base key." }
+        label: { type: string }
+        description: { type: [string, 'null'] }
+        definition:
+          description: A stored attribute definition. Cannot be `evaluated`; use `requirements` for that.
+          allOf: [{ $ref: '#/components/schemas/AttributeDefinition' }]
+        requirements:
+          type: string
+          description: >
+            Natural-language prompt. AI generates an evaluated attribute
+            definition from it (billed, `ai` rate bucket).
 
     EmailStatistics:
       type: object
@@ -1305,7 +3486,10 @@ components:
           enum: [contact, admin, system, api]
         actorIdentifier: { type: [string, 'null'] }
         context:
-          description: Raw JSON context (consent text/version, IP, user agent, source URL, form id, timestamp).
+          description: >
+            Raw JSON context (consent text/version, IP, user agent, source URL,
+            form id, timestamp). `ipAddress` and `userAgent` are stripped before
+            being returned.
 
     SuppressionInput:
       type: object
@@ -1315,21 +3499,104 @@ components:
           type: string
           format: email
           description: The email address to suppress.
-        reason: { $ref: '#/components/schemas/SuppressionReason' }
+        reason: { $ref: '#/components/schemas/SuppressionCreateReason' }
         notes: { type: [string, 'null'] }
 
     Suppression:
       type: object
-      required: [id, createdAt, communicationChannel, reason, notes, affectedContactCount]
+      required: [id, createdAt, communicationChannel, reason, notes, scope, identifierHash]
       properties:
         id: { type: string }
         createdAt: { type: string, format: date-time }
         communicationChannel: { $ref: '#/components/schemas/CommunicationChannel' }
         reason: { $ref: '#/components/schemas/SuppressionReason' }
         notes: { type: [string, 'null'] }
+        scope:
+          type: string
+          enum: [space, global]
+        identifierHash:
+          type: string
+          description: A hash of the suppressed identifier. The raw identifier is never returned.
         affectedContactCount:
           type: integer
-          description: Contacts in the space whose email matched the suppressed identifier.
+          description: >
+            Present only on `suppressions.create` and `suppressions.batchCreate`
+            responses: contacts in the space whose identifier matched.
+
+    SuppressionBatchCreateRequest:
+      type: object
+      required: [suppressions]
+      properties:
+        suppressions:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/SuppressionInput' }
+
+    SuppressionBatchCreateResultItem:
+      type: object
+      required: [index, status]
+      description: >
+        Suppression fields are present when `status` is `created` or `exists`;
+        `error` is present when `status` is `failed`.
+      allOf:
+        - type: object
+          properties:
+            index: { type: integer }
+            status:
+              type: string
+              enum: [created, exists, failed]
+            error: { $ref: '#/components/schemas/ErrorObject' }
+        - $ref: '#/components/schemas/Suppression'
+
+    SuppressionBatchCreateResult:
+      type: object
+      required: [results, summary]
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/SuppressionBatchCreateResultItem' }
+        summary:
+          type: object
+          required: [created, exists, failed]
+          properties:
+            created: { type: integer }
+            exists: { type: integer }
+            failed: { type: integer }
+
+    SuppressionBatchDeleteRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { type: string }
+
+    SuppressionBatchDeleteResultItem:
+      type: object
+      required: [index, status]
+      properties:
+        index: { type: integer }
+        status:
+          type: string
+          enum: [removed, failed]
+        error: { $ref: '#/components/schemas/ErrorObject' }
+
+    SuppressionBatchDeleteResult:
+      type: object
+      required: [results, summary]
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/SuppressionBatchDeleteResultItem' }
+        summary:
+          type: object
+          required: [removed, failed]
+          properties:
+            removed: { type: integer }
+            failed: { type: integer }
 
     EventInput:
       type: object
@@ -1360,13 +3627,7 @@ components:
         status:
           type: string
           enum: [accepted, failed]
-        error:
-          type: object
-          required: [type, code, message]
-          properties:
-            type: { type: string }
-            code: { type: [string, 'null'] }
-            message: { type: string }
+        error: { $ref: '#/components/schemas/ErrorObject' }
 
     BatchFireResult:
       type: object
@@ -1411,14 +3672,539 @@ components:
         createdAt: { type: string, format: date-time }
       additionalProperties: true
 
+    DnsRecord:
+      type: object
+      required: [type, name, value, priority, status]
+      properties:
+        type: { type: string }
+        name: { type: string }
+        value: { type: string }
+        priority: { type: [integer, 'null'] }
+        status:
+          type: string
+          enum: [not started, pending, success, failed, temporary failure]
+
+    Domain:
+      type: object
+      required: [id, createdAt, updatedAt, name, customReturnPath, verificationStarted, verifiedForSending]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: string }
+        customReturnPath: { type: string }
+        verificationStarted: { type: boolean }
+        verifiedForSending: { type: boolean }
+        records:
+          type: array
+          description: Live-checked DNS records. Present on `get`, `create`, and `verify`; omitted on `list`.
+          items: { $ref: '#/components/schemas/DnsRecord' }
+
+    DomainCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: "The domain name, e.g. example.com." }
+        customReturnPath:
+          type: string
+          default: send
+          description: The bounce-handling subdomain label.
+
+    Sender:
+      type: object
+      required: [id, createdAt, updatedAt, name, description, code, domainId, email]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        code: { type: string, description: The email local part. }
+        domainId: { type: string }
+        email: { type: string, format: email, description: "`code`@domain, derived." }
+
+    SenderCreate:
+      type: object
+      required: [name, code, domainId]
+      properties:
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        code: { type: string }
+        domainId: { type: string }
+
+    SenderUpdate:
+      type: object
+      description: At least one field must be provided.
+      properties:
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        code: { type: string }
+        domainId: { type: string }
+
+    Topic:
+      type: object
+      required: [id, createdAt, updatedAt, name, description, color, channel, private]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        color: { $ref: '#/components/schemas/BadgeColor' }
+        channel: { $ref: '#/components/schemas/CommunicationChannel' }
+        private:
+          type: boolean
+          description: Private topics only appear in the contact preferences page if the contact has been granted access.
+
+    TopicCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        color: { $ref: '#/components/schemas/BadgeColor' }
+        channel:
+          $ref: '#/components/schemas/CommunicationChannel'
+        private: { type: boolean, default: false }
+
+    TopicUpdate:
+      type: object
+      description: At least one field must be provided. `channel` is immutable.
+      properties:
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        color: { $ref: '#/components/schemas/BadgeColor' }
+        private: { type: boolean }
+
+    Segment:
+      type: object
+      required:
+        [id, createdAt, updatedAt, name, description, contactSchemaId, contactSchemaSlug, requirements, conditionDescriptionMarkdown, integrationVendorName]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        contactSchemaId: { type: string }
+        contactSchemaSlug: { type: string }
+        requirements:
+          type: string
+          description: The refined natural-language specification used to generate the condition.
+        conditionDescriptionMarkdown:
+          type: string
+          description: Human-readable markdown description of the condition. The generated expression itself is never returned.
+        integrationVendorName: { type: [string, 'null'] }
+        matchingCount:
+          type: integer
+          description: >
+            Present when the segment was just created, or just updated with new
+            `requirements`; omitted otherwise. A live count at that moment, not
+            kept in sync afterward (call `segments.count` for the current value).
+
+    SegmentCreate:
+      type: object
+      required: [name, contactSchema, requirements]
+      properties:
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        contactSchema: { type: string, description: A contact schema id or slug. }
+        requirements: { type: string, description: Natural-language description of the filter criteria. }
+
+    SegmentUpdate:
+      type: object
+      description: At least one field must be provided. Supplying `requirements` regenerates the condition (billed, `ai` rate bucket).
+      properties:
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        requirements: { type: string }
+
+    ImportFailureSample:
+      type: object
+      required: [rowNumber, identifier, reason]
+      properties:
+        rowNumber: { type: integer }
+        identifier: { type: [string, 'null'] }
+        reason: { type: string }
+
+    Import:
+      type: object
+      required:
+        [id, createdAt, schemaId, schemaSlug, fileName, byteSize, status, failureReason, rowCount, successCount, failureCount, skippedFieldCount, failureSamples, failureLogUrl, startedAt, finishedAt]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        schemaId: { type: string }
+        schemaSlug: { type: string }
+        fileName: { type: string }
+        byteSize: { type: integer }
+        status:
+          type: string
+          enum: [pending, running, succeeded, partial, failed, canceled]
+        failureReason: { type: [string, 'null'] }
+        rowCount: { type: integer }
+        successCount: { type: integer }
+        failureCount: { type: integer }
+        skippedFieldCount: { type: integer }
+        failureSamples:
+          type: array
+          items: { $ref: '#/components/schemas/ImportFailureSample' }
+        failureLogUrl:
+          type: [string, 'null']
+          description: When set, always points at `imports.downloadFailureLog`, never a raw storage URL.
+        startedAt: { type: [string, 'null'], format: date-time }
+        finishedAt: { type: [string, 'null'], format: date-time }
+
+    ImportCreate:
+      type: object
+      required: [fileUrl, byteSize]
+      properties:
+        fileUrl:
+          type: string
+          format: uri
+          description: URL of an already-uploaded CSV file. Not inline records or raw CSV text.
+        byteSize: { type: integer, description: "File size in bytes. Rejected above 50 MB." }
+        fileName: { type: [string, 'null'] }
+        defaultTags:
+          type: array
+          items: { type: string }
+        defaultSubscriptions:
+          type: array
+          items: { $ref: '#/components/schemas/CommunicationChannel' }
+
+    TemplateFrom:
+      description: "A sender: either a verified domain with a manual slug and display name, or a saved sender profile."
+      oneOf:
+        - type: object
+          required: [type, domainId, code]
+          properties:
+            type: { type: string, const: domain }
+            domainId: { type: string }
+            code: { type: string, description: Email local part. }
+            name: { type: [string, 'null'] }
+        - type: object
+          required: [type, senderId]
+          properties:
+            type: { type: string, const: sender }
+            senderId: { type: string }
+
+    DataPath:
+      type: array
+      description: A path into a data payload, as property-key segments.
+      items: { type: string }
+
+    AttributeExpansions:
+      type: object
+      description: >
+        Which evaluated attributes to compute before a record-typed data property
+        is consumed, as a map keyed by evaluated attribute key, nested
+        recursively for evaluated attributes that themselves return records. An
+        empty object computes no evaluated attributes.
+      additionalProperties:
+        $ref: '#/components/schemas/AttributeExpansions'
+
+    DataRepresentationProperty:
+      description: >
+        One property of a data representation. `record` properties reference
+        records from a schema; `json` properties are plain JSON values described
+        by a JSON schema. `schema` accepts an id or slug on input; responses
+        always echo the slug.
+      oneOf:
+        - type: object
+          required: [key, type, schema]
+          properties:
+            key: { type: string }
+            type: { type: string, const: record }
+            schema: { type: string, description: A schema id or slug. }
+            isArray: { type: boolean, default: false }
+            description: { type: [string, 'null'] }
+        - type: object
+          required: [key, type, jsonSchema]
+          properties:
+            key: { type: string }
+            type: { type: string, const: json }
+            jsonSchema:
+              type: object
+              description: A simplified JSON Schema describing the value.
+            description: { type: [string, 'null'] }
+
+    Template:
+      type: object
+      required:
+        [id, createdAt, updatedAt, name, description, transactional, contentFormat, contentEditor, content, from, recipientDataPath, expectedDataRepresentation, communicationTopicId]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        transactional: { type: boolean }
+        contentFormat:
+          type: [string, 'null']
+          enum: [mjml, html, null]
+        contentEditor:
+          type: [string, 'null']
+          enum: [rich, raw, null]
+        content:
+          oneOf:
+            - type: object
+              required: [subject, body]
+              properties:
+                subject: { type: [string, 'null'] }
+                body: { type: [string, 'null'] }
+            - type: 'null'
+        from:
+          oneOf:
+            - { $ref: '#/components/schemas/TemplateFrom' }
+            - { type: 'null' }
+        recipientDataPath: { $ref: '#/components/schemas/DataPath' }
+        expectedDataRepresentation:
+          type: array
+          items: { $ref: '#/components/schemas/DataRepresentationProperty' }
+        communicationTopicId: { type: [string, 'null'] }
+
+    TemplateCreate:
+      type: object
+      required: [transactional, content, recipientDataPath, expectedDataRepresentation]
+      properties:
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        transactional: { type: boolean }
+        content:
+          type: object
+          required: [bodyFormat, subject, body]
+          description: Raw editor content only; created templates always start in the raw editor.
+          properties:
+            bodyFormat: { type: string, enum: [mjml, html] }
+            subject: { type: string }
+            body: { type: string }
+        from: { $ref: '#/components/schemas/TemplateFrom' }
+        recipientDataPath: { $ref: '#/components/schemas/DataPath' }
+        communicationTopicId: { type: [string, 'null'] }
+        attributeExpansions: { $ref: '#/components/schemas/AttributeExpansions' }
+        expectedDataRepresentation:
+          type: array
+          items: { $ref: '#/components/schemas/DataRepresentationProperty' }
+
+    TemplateUpdate:
+      type: object
+      description: At least one field must be provided.
+      properties:
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        transactional: { type: boolean }
+        content:
+          type: object
+          required: [bodyFormat, subject, body]
+          properties:
+            bodyFormat: { type: string, enum: [mjml, html] }
+            subject: { type: string }
+            body: { type: string }
+        from: { $ref: '#/components/schemas/TemplateFrom' }
+        recipientDataPath: { $ref: '#/components/schemas/DataPath' }
+        communicationTopicId: { type: [string, 'null'] }
+        attributeExpansions: { $ref: '#/components/schemas/AttributeExpansions' }
+        expectedDataRepresentation:
+          type: array
+          items: { $ref: '#/components/schemas/DataRepresentationProperty' }
+
     TemplateSendRequest:
       type: object
       required: [data]
       properties:
         data:
           type: object
-          description: Payload keyed by the template's expected data-representation properties.
+          description: >
+            Payload keyed by the template's expected data-representation
+            properties. Minimal identifiers suffice for record properties (e.g.
+            `{ "email": "user@example.com" }` for a contact); the platform
+            finds-or-creates the record, then reads it back for rendering.
           additionalProperties: true
+
+    TemplateSendResponse:
+      type: object
+      required: [emailId, status, error]
+      properties:
+        emailId: { type: [string, 'null'] }
+        status:
+          type: [string, 'null']
+          enum: [sent, failed, null]
+        error:
+          type: [string, 'null']
+          description: A generic message when `status` is `failed`. The real failure detail stays server-side.
+
+    BroadcastSchedulingStatus:
+      type: string
+      enum: [none, draft, send now, send at]
+
+    BroadcastAudience:
+      description: The broadcast's resolved audience.
+      oneOf:
+        - type: object
+          required: [type]
+          properties:
+            type: { type: string, const: all }
+        - type: object
+          required: [type, segmentId]
+          properties:
+            type: { type: string, const: segment }
+            segmentId: { type: string }
+        - type: object
+          required: [type, requirements, conditionDescriptionMarkdown]
+          properties:
+            type: { type: string, const: custom filter }
+            requirements: { type: string }
+            conditionDescriptionMarkdown: { type: string }
+
+    BroadcastAudienceInput:
+      description: >
+        The audience to create or update a broadcast with. A `custom filter`
+        audience can only be set via `broadcasts.generateAudience`, never
+        directly through create/update.
+      oneOf:
+        - type: object
+          required: [type]
+          properties:
+            type: { type: string, const: all }
+        - type: object
+          required: [type, segmentId]
+          properties:
+            type: { type: string, const: segment }
+            segmentId: { type: string }
+
+    BroadcastContentInput:
+      type: object
+      required: [bodyFormat, subject, body]
+      description: Raw editor content only, no rich-editor structure.
+      properties:
+        bodyFormat: { type: string, enum: [mjml, html] }
+        subject: { type: string }
+        body: { type: string }
+        transactional: { type: boolean, default: false }
+        from: { $ref: '#/components/schemas/TemplateFrom' }
+        communicationTopicId: { type: [string, 'null'] }
+
+    Broadcast:
+      type: object
+      required:
+        [id, createdAt, updatedAt, name, description, contactSchemaId, contactSchemaSlug, schedulingStatus, scheduledFor, sendingStartedAt, sendingFinishedAt, failureReason, audience, hasContent]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        contactSchemaId: { type: string }
+        contactSchemaSlug: { type: string }
+        schedulingStatus: { $ref: '#/components/schemas/BroadcastSchedulingStatus' }
+        scheduledFor: { type: [string, 'null'], format: date-time }
+        sendingStartedAt: { type: [string, 'null'], format: date-time }
+        sendingFinishedAt: { type: [string, 'null'], format: date-time }
+        failureReason: { type: [string, 'null'] }
+        audience: { $ref: '#/components/schemas/BroadcastAudience' }
+        hasContent:
+          type: boolean
+          description: "Never includes the underlying email content itself (e.g. raw Adaptyle markup), only this boolean summary."
+
+    BroadcastCreate:
+      type: object
+      required: [contactSchema]
+      properties:
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        contactSchema: { type: string, description: A contact schema id or slug. }
+        scheduledFor: { type: [string, 'null'], format: date-time }
+        audience: { $ref: '#/components/schemas/BroadcastAudienceInput' }
+        content: { $ref: '#/components/schemas/BroadcastContentInput' }
+
+    BroadcastUpdate:
+      type: object
+      description: >
+        At least one field must be provided. Only `name`/`description`/
+        `audience`/`scheduledFor` are updatable; content is not editable through
+        this endpoint. Rejected once sending has started.
+      properties:
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        audience: { $ref: '#/components/schemas/BroadcastAudienceInput' }
+        scheduledFor: { type: [string, 'null'], format: date-time }
+
+    BroadcastSendRequest:
+      type: object
+      description: An empty or omitted body sends now; a `scheduledFor` schedules for later.
+      properties:
+        scheduledFor: { type: string, format: date-time }
+
+    BroadcastAudienceGenerateRequest:
+      type: object
+      required: [requirements]
+      properties:
+        requirements:
+          type: string
+          description: Natural-language description of the audience filter criteria.
+
+    BroadcastAudienceGenerateResponse:
+      type: object
+      required: [audience, matchingCount]
+      properties:
+        audience:
+          type: object
+          required: [type, requirements, conditionDescriptionMarkdown]
+          properties:
+            type: { type: string, const: custom filter }
+            requirements: { type: string }
+            conditionDescriptionMarkdown: { type: string }
+        matchingCount:
+          type: integer
+          description: A live count at generation time, not kept in sync afterward.
+
+    BroadcastRun:
+      type: object
+      required: [id, createdAt, contactId, contactEmail, status, failureReason, email]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        contactId: { type: string }
+        contactEmail: { type: [string, 'null'] }
+        status:
+          type: string
+          enum: [sent, failed, pending]
+        failureReason: { type: [string, 'null'] }
+        email:
+          oneOf:
+            - type: object
+              required: [id, sentAt, opensCount, clicksCount, bounced, complained]
+              properties:
+                id: { type: string }
+                sentAt: { type: [string, 'null'], format: date-time }
+                opensCount: { type: integer }
+                clicksCount: { type: integer }
+                bounced: { type: boolean }
+                complained: { type: boolean }
+            - type: 'null'
+
+    EmailAggregatedMetrics:
+      type: object
+      required: [sent, delivered, bounced, deliveryDelays, rejected, failed, complained, unsubscribed, opens, uniqueOpens, clicks, uniqueClicks]
+      properties:
+        sent: { type: integer }
+        delivered: { type: integer }
+        bounced: { type: integer }
+        deliveryDelays: { type: integer }
+        rejected: { type: integer }
+        failed: { type: integer }
+        complained: { type: integer }
+        unsubscribed: { type: integer }
+        opens: { type: integer }
+        uniqueOpens: { type: integer }
+        clicks: { type: integer }
+        uniqueClicks: { type: integer }
+
+    BroadcastMetricsResponse:
+      type: object
+      description: "`email` is omitted entirely when the broadcast has no email content yet."
+      properties:
+        email: { $ref: '#/components/schemas/EmailAggregatedMetrics' }
 
     WebhookTrigger:
       type: string
@@ -1450,6 +4236,7 @@ components:
       enum: [live, paused, circuit breaker]
 
     WebhookCondition:
+      description: The webhook's resolved filter condition. The generated expression is never returned, only its description.
       oneOf:
         - type: object
           required: [type]
@@ -1467,6 +4254,10 @@ components:
             description: { type: string }
 
     WebhookConditionInput:
+      description: >
+        The filter condition to create or update a webhook with. A `custom
+        filter` condition generates via AI from `requirements` (billed, `ai`
+        rate bucket).
       oneOf:
         - type: object
           required: [type]
@@ -1477,6 +4268,13 @@ components:
           properties:
             type: { type: string, const: segment }
             segmentId: { type: string }
+        - type: object
+          required: [type, requirements]
+          properties:
+            type: { type: string, const: custom filter }
+            requirements:
+              type: string
+              description: Natural-language description of the filter criteria.
 
     Webhook:
       type: object
@@ -1561,6 +4359,72 @@ components:
         id: { type: string }
         signatureVerificationSecret: { type: string }
         updatedAt: { type: string, format: date-time }
+
+    Workflow:
+      type: object
+      required: [id, createdAt, updatedAt, name, description, paused, isDirty, published]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        paused: { type: boolean }
+        isDirty: { type: boolean, description: Has unpublished changes. }
+        published: { type: boolean }
+
+    WorkflowRunStepHistoryRecord:
+      type: object
+      required: [stepId, stepLabel, slotKey, enteredAt, leftAt, failureReason]
+      properties:
+        stepId: { type: string }
+        stepLabel: { type: [string, 'null'] }
+        slotKey: { type: [string, 'null'] }
+        enteredAt: { type: string, format: date-time }
+        leftAt: { type: string, format: date-time }
+        failureReason: { type: [string, 'null'] }
+
+    WorkflowRun:
+      type: object
+      required: [id, createdAt, updatedAt, versionId, status, failureReason, stepHistory]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        versionId: { type: string }
+        status:
+          type: string
+          enum: [running, completed, failed]
+        failureReason: { type: [string, 'null'] }
+        stepHistory:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowRunStepHistoryRecord' }
+
+    ApiKey:
+      type: object
+      required: [id, createdAt, name, keyDisplay, spaceId, createdViaApiKeyId]
+      properties:
+        id: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        name: { type: [string, 'null'] }
+        keyDisplay: { type: string, description: "A masked preview, e.g. `max_...ab12`." }
+        spaceId: { type: [string, 'null'] }
+        createdViaApiKeyId: { type: [string, 'null'] }
+
+    ApiKeyCreate:
+      type: object
+      properties:
+        name: { type: [string, 'null'] }
+
+    ApiKeyWithSecret:
+      allOf:
+        - { $ref: '#/components/schemas/ApiKey' }
+        - type: object
+          required: [key]
+          properties:
+            key:
+              type: string
+              description: The plaintext API key. Shown exactly once; save it immediately.
 
     FormContactInput:
       type: object
