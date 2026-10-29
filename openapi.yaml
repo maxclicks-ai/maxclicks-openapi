@@ -4,61 +4,41 @@ info:
   title: maxclicks Public API
   version: 1.1.0
   summary: The official REST API for the maxclicks email, CRM, and automation platform.
-  description: >
-    The maxclicks Public API v1. Read and write contacts and objects, fire events, build and
-    query segments, send templates, trigger and measure broadcasts, manage webhooks, trigger and
-    inspect workflows, manage the suppression list, and submit forms.
+  description: >-
+    The maxclicks Public API connects customer data to prepared audiences, emails, and journeys.
+    Version 1.1.0 is served under /v1. Schemas, attributes, template content, broadcast content,
+    domains, senders, topics, and keys are authored in the app. This specification documents 59
+    functional operations; PATCH/DELETE /events/{id} are immutable guards that always return 405.
 
 
-    The surface follows one principle: entities are authored in the maxclicks app, and the API
-    triggers, reads and measures them. Schemas, attributes, templates, broadcasts, domains,
-    senders, topics and API keys are therefore created and configured in the app; this API reads
-    them so a caller can discover ids, shapes and status, and drives the sends and automations
-    that depend on them.
+    Authenticated operations use a Bearer API key, or an OAuth 2.1 access token for a connection a
+    user approved, and the owner's space permissions. An OAuth connection is further limited to the
+    scopes its user granted. Results use data, optionally warnings and pagination. Standard failures use error.type/code/message and
+    optional issues. Event batch abort is a 422 data result, and an unresolved idempotency
+    persistence failure may omit error.type.
 
 
-    All authenticated endpoints use a bearer API key. Successful responses are wrapped in a
-    `data` envelope (with an optional `warnings` array); list endpoints add a `pagination`
-    block (offset-based, except `events.list`, which is cursor-based). Errors use a
-    Stripe-style `{ error: { type, code, message, issues? } }` envelope: `type` is
-    `invalid_request_error` for every 4xx and `api_error` for every 5xx; `code` is a stable
-    machine-readable string or `null`; `issues` is present only on the handful of validation-gate
-    failures that report more than one problem at once (for example `broadcasts.send`'s
-    `broadcast_invalid`).
+    Eighteen operations accept Idempotency-Key, as declared by their header parameter. Sixteen
+    use the generic response cache: keep the same calling key, method, path, and body on retries.
+    Recorded results include errors and webhook secrets. Completed opaque-key responses have a
+    nominal 24-hour retention period; timed record keys have a separate admission window. Unresolved
+    operations need reconciliation. Template send instead requires a durable send identity and
+    retains its original message; it does not use the generic response-cache expiry or replay
+    headers. Record deletion requires an explicit attempt key and returns current operation status,
+    rather than a cached response. Event acceptance uses eventId, and event identity changes use operationId plus a
+    per-alias revision.
 
 
-    Rate limits are enforced per API key, in three buckets: `read` (100 requests/second, every
-    `GET`), `write` (25 requests/second, every other `POST`/`PATCH`/`DELETE`), and `ai` (10
-    requests/minute, for the LLM-backed endpoints: `segments.create`, and
-    `webhooks.create`/`webhooks.update` when they carry a `custom filter` condition).
-    Exceeding a limit returns `429` with a `Retry-After` header
-    (an HTTP date, UTC).
+    HTTP acceptance does not imply finished downstream work. Events return a durable receipt and
+    have a separate readiness endpoint; record deletion returns a pollable operation status;
+    workflow triggers create a run; broadcast sends schedule work. Use the resource reference for
+    the exact inputs and outcome checks for each operation.
 
 
-    Beyond the usual 200/201/400/401/403/404/409/422/429/500, four status codes appear on this
-    surface: `402` payment required (`insufficient_credits` on an AI-generation call or a
-    schema with AI auto-fill; `email_limit_reached` on `templates.send`); `405` method not
-    allowed (`events_immutable`, events cannot be edited or deleted, fire a new one); `413`
-    payload too large (`payload_too_large`, request body over 10 MB); `415` unsupported media
-    type (`unsupported_media_type`). `400` also covers `malformed_json` (body is not valid JSON)
-    and, on paginated list endpoints, `offset_too_large` (an `offset` past the pagination cap).
-
-
-    Seven mutating operations (records.create, records.upsert, suppressions.batchCreate,
-    suppressions.batchDelete, broadcasts.send, templates.send, workflows.trigger) accept an
-    `Idempotency-Key` header to make retries safe: the first request with a given key claims and
-    executes normally; a retry while the original is still in flight returns `409
-    idempotency_conflict` (unless the pending claim is older than 60 seconds, in which case it is
-    treated as abandoned); a retry after the original completed replays the original status and
-    body verbatim with an `Idempotent-Replay: true` response header. A `5xx` response is never
-    cached, and neither is a `4xx`: a rejected request did nothing, so the caller is free to fix the
-    payload and retry with the same key. Records expire after 24 hours. The key is scoped to the API
-    key, the resolved request path and a hash of the request body, so the same key against two
-    different resources does not collide, and reusing a key with a CHANGED body returns `422
-    idempotency_key_reused` rather than silently replaying the previous response. Secret-returning
-    creates (`webhooks.create`,
-    `webhooks.rotateSecret`) deliberately do not support it, since replaying the cached response
-    would re-expose the plaintext secret.
+    API request limits are read=100/second, write=25/second, ai=10/minute per key. Event admission
+    also has shared occurrence/backlog/receipt caps. Retry-After can be a delay in seconds or an
+    HTTP date. Body size is limited to 10 MB; normalized event input is limited to 256 KiB. Offset
+    traversal is capped at 10,000; ready events use cursors over a maximum 90-day query window.
   contact:
     name: maxclicks
     url: https://maxclicks.ai
@@ -79,26 +59,30 @@ servers:
 
 security:
   - bearerAuth: []
+  - oauth2: []
 
 tags:
   - name: Meta
     description: Identify the calling API key.
   - name: Schemas
-    description: Manage the space's schemas (contact, object, event).
+    description: Read the space's schemas (contact, object, event). Schema definitions are authored in the app.
   - name: Attributes
     description: Read a schema's attributes. Attributes are authored in the app.
   - name: Records
-    description: Create, read, update, and delete contact and object records.
+    description: Keep stored contact and object data current, inspect consent history, and track
+      deletion to completion.
   - name: Suppressions
     description: Manage the email do-not-contact list. Requires an admin key.
   - name: Events
-    description: Fire trigger events and read them back.
+    description: Accept durable business events, inspect readiness, and bind anonymous source identities
+      to contacts.
   - name: Domains
-    description: Read sending domains and their DNS verification status. Domains are added and verified in the app.
+    description: Read sending domains and their DNS verification status. Domains are added and verified
+      in the app.
   - name: Senders
-    description: Manage saved sender profiles.
+    description: Read saved sender profiles configured in the app.
   - name: Topics
-    description: Manage communication topics.
+    description: Read communication topics configured in the app.
   - name: Segments
     description: Generate and manage AI-defined contact filters.
   - name: Broadcasts
@@ -108,7 +92,7 @@ tags:
   - name: Webhooks
     description: Manage outgoing webhooks.
   - name: Workflows
-    description: Trigger workflows and inspect their runs.
+    description: Trigger published journeys, pause execution, and inspect runs and paged step history.
   - name: Forms
     description: Public form submission and double opt-in confirmation.
   - name: Emails
@@ -120,9 +104,9 @@ paths:
       tags: [Meta]
       summary: Identify the calling API key
       description: >
-        Returns the key metadata, its owning user, the bound space (if any), and
-        the caller's role. Works for space-unbound keys, in which case `space`
-        and `role` are null.
+        Returns the key metadata, its owning user, the bound space (if any), and the caller's role.
+        Works for space-unbound keys, in which case `space` and `role` are null. For an OAuth access
+        token, `oauth` names the resource it was issued for, its granted scopes and its expiry.
       operationId: meta.me
       responses:
         '200':
@@ -206,7 +190,13 @@ paths:
     get:
       tags: [Attributes]
       summary: List attributes
-      description: Lists a schema's attributes, base attributes first, then custom attributes.
+      description: Lists base attributes first, then custom attributes. Base ids use base:<key> and have
+        null sequence and timestamps. definition.type uses the documented stored/evaluated types;
+        aggregate is definition.valueSource.type, not a top-level type. Only definitions with type
+        other than evaluated and no valueSource are writable. Definition metadata can include
+        auto-fill settings, aggregate source configuration, or evaluated target/reference
+        descriptions; generated expressions are excluded. Record GET/list does not expand evaluated
+        or aggregate values. Attribute authoring is available in the app, not through public v1.
       operationId: attributes.list
       parameters:
         - { $ref: '#/components/parameters/LimitParam' }
@@ -237,7 +227,11 @@ paths:
     get:
       tags: [Records]
       summary: List records
-      description: Lists records in a contact or object schema, oldest first.
+      description: Lists stored contact or object records, ordered by createdAt ascending then id
+        ascending. Custom values are flattened at the top level alongside platform fields. Evaluated
+        and aggregate attributes are not expanded. This endpoint accepts limit/offset only; it has
+        no ad-hoc search, time filter, include, or trait-expansion query. Traversal is capped;
+        pagination.hasMore can be false when totalCount exceeds the reachable window.
       operationId: records.list
       parameters:
         - { $ref: '#/components/parameters/LimitParam' }
@@ -266,24 +260,33 @@ paths:
       tags: [Records]
       summary: Create a record
       description: >
-        Strictly creates one contact or object record (never updates an existing
-        one). Any `id` in the body is ignored. `source` is forced to `api`. If the
-        schema has an AI auto-fill attribute, credits are checked first. Supports
-        `Idempotency-Key`. Errors: `schema_not_found`, `identifier_conflict` (409),
-        `insufficient_credits` (402).
+        Strictly creates one contact or object record (never updates an existing one). Any `id` in
+        the body is ignored. `source` is forced to `api`. Missing AI auto-fill values require
+        a timed `Idempotency-Key` in the format `rpi1.<13-digit Unix milliseconds>.<UUIDv4>`.
+        Generate it once and retain it with the input. A completed paid preparation is reused;
+        only a new model call needs new credit admission. Supports `Idempotency-Key`. Errors:
+        `schema_not_found`, `identifier_conflict` (409), `insufficient_credits` (402).
       operationId: records.create
       parameters:
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/RecordInput' }
+            example:
+              email: sarah@example.com
+              firstName: Sarah
       responses:
         '201':
           description: The created record.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecordEnvelope' }
@@ -293,10 +296,20 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
 
   /schemas/{schema}/records/upsert:
     parameters:
@@ -304,34 +317,51 @@ paths:
     post:
       tags: [Records]
       summary: Upsert a record
-      description: >
-        Creates or updates a record by identity. Contact match cascade is
-        id, then userId, then email, then phone; object match is id, then
-        externalId. Per-field identifier conflicts are reverted and reported in
-        `warnings`. Returns 201 when created, 200 when updated. Same AI auto-fill
-        credit check as create. Supports `Idempotency-Key`. Errors:
-        `schema_not_found`, `record_not_found` (404, an explicit `id` matched no
-        record), `insufficient_credits` (402).
+      description: >-
+        Creates or updates a contact or object. An explicit id selects that exact record or returns
+        record_not_found. Otherwise contact matching uses userId first; email can match only a
+        contact without userId; phone can match only a contact without userId or email. Objects
+        match by externalId. Per-field identifier collisions may be skipped and reported in
+        warnings; inspect the returned record. Returns 201 for creation or 200 for update. Any
+        missing AI auto-fill value on a new record requires a timed Idempotency-Key in the format
+        `rpi1.<13-digit Unix milliseconds>.<UUIDv4>`. Generate it once and retain it with the input.
+        Paid prepared values can complete a retry without new credits; new model calls still require
+        credit admission. Required writable fields without a value/default can fail with
+        required_attribute_missing (400, issues names the key).
       operationId: records.upsert
       parameters:
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/RecordInput' }
+            example:
+              userId: customer_1042
+              email: sarah@example.com
+              firstName: Sarah
       responses:
         '200':
           description: The updated record.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecordEnvelope' }
         '201':
           description: The created record.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RecordEnvelope' }
@@ -340,10 +370,22 @@ paths:
         '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Gone' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
 
   /schemas/{schema}/records/{id}:
     parameters:
@@ -364,19 +406,27 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+      description: Reads one contact or object in this schema. Stored custom values and platform fields
+        are flattened; evaluated and aggregate attributes are not expanded. There is no
+        include/expand query. Missing schema or record returns 404.
     patch:
       tags: [Records]
       summary: Update a record
-      description: >
-        Partially updates a record. An explicit null clears a nullable field.
-        Does not run the AI auto-fill credit check that create/upsert do.
-        Errors: `schema_not_found`, `record_not_found`, `identifier_conflict` (409).
+      description: >-
+        Partially updates a record. The path id overrides any body id. Explicit null clears a
+        nullable field; omit a field to preserve it. Non-writable evaluated/aggregate keys are not
+        accepted as stored inputs. Normalization and skipped per-field identity updates can produce
+        warnings. The endpoint does not use Idempotency-Key. Errors: schema_not_found,
+        record_not_found, identifier_conflict, or required_attribute_missing (400, issues names the
+        missing key).
       operationId: records.update
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/RecordInput' }
+            example:
+              firstName: Sarah
       responses:
         '200':
           description: The updated record.
@@ -396,17 +446,63 @@ paths:
       tags: [Records]
       summary: Delete a record
       operationId: records.delete
+      parameters:
+        - $ref: '#/components/parameters/RecordDeletionAttemptKeyParam'
       responses:
         '200':
-          description: The record was deleted.
+          description: Record deletion is completed.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+              example:
+                data:
+                  operationId: delete:records:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+                  status: completed
+                  canCancel: false
+                  message: Record deletion is completed.
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: "#/components/schemas/RecordDeletionStatus"
+                  warnings:
+                    $ref: "#/components/schemas/Warnings"
+        '202':
+          description: Deletion is unfinished. Poll the operation until status is completed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: "#/components/schemas/RecordDeletionStatus"
+                  warnings:
+                    $ref: "#/components/schemas/Warnings"
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+      description: >-
+        Requests durable deletion of a contact or object. Requires an Idempotency-Key identifying
+        this explicit attempt: 1..128 characters, beginning with an alphanumeric character and
+        containing only alphanumeric characters, underscore, period, colon or hyphen. Preserve it
+        when recovering a lost response. The key identifies the operation; it does not use generic
+        response-cache replay headers. The response carries operationId/status/canCancel/message.
+        New admissions pause while accepted Events and deliveries drain; no records have been removed
+        at that stage. Once removal begins, conflicting workspace work remains closed during cleanup.
+        Poll GET /record-deletions/{operationId}; pending is unfinished, blocked needs reconciliation,
+        and completed confirms erasure. Cancellation is available to the original requester with
+        current write permission only before removal begins. This handler returns HTTP 202 for
+        non-completed states and HTTP 200 for completed. A cancelled attempt must not be reused as
+        a new deletion. An unknown record returns 404 record_not_found; after completion, retrying
+        DELETE can therefore return 404, so retain the operationId for status inspection.
 
   /schemas/{schema}/records/{id}/audit-trail:
     parameters:
@@ -416,8 +512,8 @@ paths:
       tags: [Records]
       summary: List a contact's audit trail
       description: >
-        Lists the consent and communication audit trail for a contact, newest
-        first. Contact schemas only. Errors: `schema_not_found`, `record_not_found`.
+        Lists the consent and communication audit trail for a contact, newest first. Contact schemas
+        only. Errors: `schema_not_found`, `record_not_found`.
       operationId: records.auditTrail
       parameters:
         - name: channel
@@ -452,9 +548,9 @@ paths:
       tags: [Suppressions]
       summary: List suppressions
       description: >
-        Lists suppressions for the caller's space, newest first. Includes global
-        suppressions (not space-scoped) alongside space-scoped ones, since both
-        block sends to the caller's contacts. Requires an admin key.
+        Lists suppressions for the caller's space, newest first. Includes global suppressions (not
+        space-scoped) alongside space-scoped ones, since both block sends to the caller's contacts.
+        Requires an admin key.
       operationId: suppressions.list
       parameters:
         - name: identifier
@@ -486,9 +582,8 @@ paths:
       tags: [Suppressions]
       summary: Create a suppression
       description: >
-        Suppresses an email identifier for the space. Requires an admin key. Not
-        Idempotency-Key aware. Error: `suppression_already_exists` (409; `manual`
-        and `legal` are distinct reasons).
+        Suppresses an email identifier for the space. Requires an admin key. Not Idempotency-Key
+        aware. Error: `suppression_already_exists` (409; `manual` and `legal` are distinct reasons).
       operationId: suppressions.create
       requestBody:
         required: true
@@ -520,13 +615,13 @@ paths:
       tags: [Suppressions]
       summary: Batch-create suppressions
       description: >
-        Bulk-creates 1 to 100 suppressions in one call. Each item is validated and
-        processed independently: an existing suppression for the same identifier
-        and reason returns `exists` rather than failing the item. Requires an
-        admin key. Supports `Idempotency-Key`. Always responds `200`.
+        Bulk-creates 1 to 100 suppressions in one call. Each item is validated and processed
+        independently: an existing suppression for the same identifier and reason returns `exists`
+        rather than failing the item. Requires an admin key. Supports `Idempotency-Key`. Always
+        responds `200`.
       operationId: suppressions.batchCreate
       parameters:
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
       requestBody:
         required: true
         content:
@@ -536,7 +631,12 @@ paths:
         '200':
           description: Per-item results and a summary.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema:
@@ -552,19 +652,29 @@ paths:
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
 
   /contacts/suppressions/batch-remove:
     post:
       tags: [Suppressions]
       summary: Batch-delete suppressions
       description: >
-        Bulk-removes 1 to 100 suppressions by id in one call. Each id is gated
-        exactly like the single delete (must belong to the caller's space; reason
-        must be `manual` or `legal`). Requires an admin key. Supports
-        `Idempotency-Key`. Always responds `200`.
+        Bulk-removes 1 to 100 suppressions by id in one call. Each id is gated exactly like the
+        single delete (must belong to the caller's space; reason must be `manual` or `legal`).
+        Requires an admin key. Supports `Idempotency-Key`. Always responds `200`.
       operationId: suppressions.batchDelete
       parameters:
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
       requestBody:
         required: true
         content:
@@ -574,7 +684,12 @@ paths:
         '200':
           description: Per-item results and a summary.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema:
@@ -590,6 +705,17 @@ paths:
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
 
   /contacts/suppressions/{id}:
     parameters:
@@ -597,11 +723,11 @@ paths:
     delete:
       tags: [Suppressions]
       summary: Delete a suppression
-      description: >
-        Removes a suppression, re-allowing communication to that identifier.
-        Requires an admin key. Not Idempotency-Key aware. Errors:
-        `suppression_not_found`, `suppression_reason_not_removable` (403, a
-        system-applied reason such as a hard bounce, not `manual`/`legal`).
+      description: >-
+        Deletes a manual or legal suppression. Requires admin permission and supports
+        Idempotency-Key. Missing suppression returns suppression_not_found; automatic provider
+        bounce/complaint suppressions cannot be removed through this endpoint. Removing a
+        suppression is separate from granting contact marketing consent.
       operationId: suppressions.delete
       responses:
         '200':
@@ -609,26 +735,44 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /events:
     get:
       tags: [Events]
       summary: List events
-      description: >
-        Cursor-paginated event history for one event schema, newest first, read
-        through the ClickHouse-backed archive (so it sees every event ever fired,
-        not just ones that triggered backend processing). `from`/`to` default to
-        the 7 days before now when omitted; a wider span than
-        `config.publicApi.maximumEventListRangeDays` (90 days) is silently clamped
-        with a warning, not rejected. This endpoint uses the distinct cursor
-        pagination envelope, not the offset envelope used elsewhere in v1: there
-        is no `offset` parameter and no `totalCount`. Errors: `schema_not_found`,
-        `invalid_cursor`, `invalid_time_range`, `event_archive_unavailable` (502).
+      description: >-
+        Lists only ready business events for one event schema. Results are ordered by occurredAt
+        descending, then id descending. The time filter is inclusive from and exclusive to; defaults
+        are the seven days before now. A range wider than 90 days is clamped with a warning. Uses
+        cursor pagination: no offset and no totalCount. Pending, failed, and outcome_unknown
+        acceptances are absent; use events.status to inspect them. Invalid times return 400
+        invalid_time_range; malformed cursors return 400 invalid_cursor. Events are read from the
+        operational event store, not the analytics archive.
       operationId: events.list
       parameters:
         - name: schema
@@ -676,24 +820,26 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
-        '502': { $ref: '#/components/responses/IngestUnavailable' }
 
   /events/{schema}:
-    x-note: >
-      OpenAPI templates `/events/{schema}` (fire) and `/events/{id}` (get one) as the same path
-      shape, so this path item merges both under one templated path with `post` and `get`,
-      mirroring how the server dispatches them by method. The wire URLs are unchanged.
-      `PATCH`/`DELETE /events/{id}` always return `405 events_immutable` ("Events are immutable.
-      Fire a new event instead."), a deliberate guard, not a real operation, and not modeled here.
+    x-note: >-
+      PATCH and DELETE /events/{id} are immutable guards that always return 405 events_immutable.
+      They are not mutation operations. There is no GET /events/{id}; use GET
+      /events/{schema}/{id}/status for an acceptance receipt.
     post:
       tags: [Events]
       summary: Fire an event
-      description: >
-        Fires a single event of the given event schema. Asynchronous fire and
-        forget: the event is handed to the ingest pipeline and 202 is returned
-        with the accepted count. The body is the flat event input. Not
-        Idempotency-Key aware; dedupe with your own `eventId` instead. Errors:
-        `schema_not_found`, `ingest_unavailable` (502).
+      description: >-
+        Durably accepts one business event and returns 202 with its immutable acceptance receipt.
+        Missing AI auto-fill fields are prepared asynchronously; readinessAtAcceptance is pending or
+        ready. An accepted event is visible to event lists and consumers only once ready. Supply a
+        stable eventId and retry the same normalized payload and occurredAt to recover the original
+        receipt with isDuplicate=true. Changed input under the same eventId returns 409
+        event_id_conflict; erased occurrences return 409 event_erased. Idempotency-Key is not used.
+        The normalized event input is limited to 256 KiB. occurredAt must be within the previous 366
+        days or five minutes into the future. contactId and objectId are optional, mutually
+        exclusive explicit subjects in this space. Event admission has separate rate, backlog, and
+        receipt-storage limits in addition to the API write bucket.
       operationId: events.fire
       parameters:
         - name: schema
@@ -706,9 +852,12 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/EventInput' }
+            example:
+              eventId: order_1042_paid
+              amount: 42
       responses:
         '202':
-          description: The event was accepted by the ingest pipeline.
+          description: Durable event acceptance receipt; inspect readiness separately.
           content:
             application/json:
               schema:
@@ -724,27 +873,38 @@ paths:
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-        '502': { $ref: '#/components/responses/IngestUnavailable' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /events/{schema}/batch:
     parameters:
       - { $ref: '#/components/parameters/SchemaParam' }
     post:
       tags: [Events]
       summary: Fire a batch of events
-      description: >
-        Fires up to 500 events of one schema. With `onError: continue` (the
-        default) every item is validated, the whole valid subset is handed to the
-        ingest pipeline in one call, and 200 is returned with per-item results;
-        if that single ingest call itself fails, the whole request fails `502
-        ingest_unavailable` rather than a partial success. With `onError: abort`
-        the batch stops at the first invalid item, ingests nothing, and returns
-        422 with `failedIndex`. Not Idempotency-Key aware.
+      description: >-
+        Accepts 1–500 events of one schema. With onError=continue (default), each event commits
+        independently; inspect every result, including failures, even on HTTP 200. Accepted items
+        include their immutable receipt. Admission failures include retryAfterMilliseconds. With
+        onError=abort, a validation or admission failure rolls back new acceptances in that
+        transaction, marks earlier accepted results rolled_back, and returns HTTP 422 with
+        data.results, data.summary, and data.failedIndex. Later items are not attempted. Existing
+        receipts encountered as duplicates remain existing occurrences. A 422 abort response is a
+        business-result data envelope, not the standard error envelope. Each item uses eventId
+        deduplication; Idempotency-Key is not used. Individual events retain the 256 KiB and
+        occurredAt limits, and the whole HTTP body remains limited to 10 MB.
       operationId: events.fireBatch
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/EventBatchRequest' }
+            example:
+              events:
+                - eventId: order_1042_paid
+                  amount: 42
+              onError: continue
       responses:
         '200':
           description: Per-item results and a summary.
@@ -763,7 +923,8 @@ paths:
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '422':
-          description: The batch aborted on the first invalid item.
+          description: Batch aborted; earlier new acceptances were rolled back. Inspect data.results and
+            data.failedIndex.
           content:
             application/json:
               schema:
@@ -773,7 +934,8 @@ paths:
                   data: { $ref: '#/components/schemas/BatchFireResult' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-        '502': { $ref: '#/components/responses/IngestUnavailable' }
+        "500":
+          $ref: "#/components/responses/ServerError"
 
   /domains:
     get:
@@ -932,11 +1094,10 @@ paths:
       tags: [Segments]
       summary: Create a segment
       description: >
-        Generates a contact filter from a natural-language `requirements` prompt
-        (every create is an AI call, in the `ai` rate bucket; credits are checked
-        first) and persists it in one call. The response includes a live
-        `matchingCount`. The generated expression is never returned. Errors:
-        `schema_not_found`, `invalid_segment`, `segment_generation_failed` (422),
+        Generates a contact filter from a natural-language `requirements` prompt (every create is an
+        AI call, in the `ai` rate bucket; credits are checked first) and persists it in one call.
+        The response includes a live `matchingCount`. The generated expression is never returned.
+        Errors: `schema_not_found`, `invalid_segment`, `segment_generation_failed` (422),
         `segment_name_conflict` (409), `insufficient_credits` (402).
       operationId: segments.create
       requestBody:
@@ -944,6 +1105,10 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/SegmentCreate' }
+            example:
+              name: Engaged customers
+              contactSchema: customers
+              requirements: Contacts who have opened an email in the last 30 days.
       responses:
         '201':
           description: The created segment.
@@ -955,6 +1120,13 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/Segment' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
@@ -966,6 +1138,15 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /segments/{id}:
     parameters:
@@ -995,9 +1176,9 @@ paths:
       tags: [Segments]
       summary: Delete a segment
       description: >
-        Errors: `segment_not_found`, `segment_integration_owned` (403),
-        `segment_in_use` (409, used as a broadcast audience, workflow trigger, or
-        webhook condition, or referenced by other entities).
+        Errors: `segment_not_found`, `segment_integration_owned` (403), `segment_in_use` (409, used
+        as a broadcast audience, workflow trigger, or webhook condition, or referenced by other
+        entities).
       operationId: segments.delete
       responses:
         '200':
@@ -1005,12 +1186,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /segments/{id}/count:
     parameters:
@@ -1049,9 +1248,9 @@ paths:
       tags: [Segments]
       summary: List a segment's matching contacts
       description: >
-        Paginated contact records currently matching the segment. `limit` is
-        additionally hard-capped at `config.segment.maximumContactsPageSize` (100)
-        regardless of the requested value. Error: `segment_not_found`.
+        Paginated contact records currently matching the segment. `limit` is additionally
+        hard-capped at `config.segment.maximumContactsPageSize` (100) regardless of the requested
+        value. Error: `segment_not_found`.
       operationId: segments.listContacts
       parameters:
         - { $ref: '#/components/parameters/LimitParam' }
@@ -1130,17 +1329,21 @@ paths:
     patch:
       tags: [Broadcasts]
       summary: Update a broadcast
-      description: >
-        Only `name`/`description`/`audience`/`scheduledFor` are updatable.
-        `schedulingStatus` only ever changes through `POST /:id/send`. Rejected
-        once sending has started. Errors: `broadcast_not_found`,
-        `broadcast_already_sending` (409), `invalid_broadcast`, `segment_not_found`.
+      description: >-
+        Updates name, description, scheduledFor, and/or audience before sending starts. At least one
+        field is required. Audience accepts all or an existing segment for the broadcast contact
+        schema; custom filter generation and content authoring are not available here. Concurrent
+        changes or a planning claim can return 409 broadcast_changed; a started send cannot be
+        edited. Supports Idempotency-Key. Cancel/stop/resume/redrive controls are available through
+        app workflows, not this public endpoint.
       operationId: broadcasts.update
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/BroadcastUpdate' }
+            example:
+              name: September customer update
       responses:
         '200':
           description: The updated broadcast.
@@ -1152,6 +1355,13 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/Broadcast' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1161,33 +1371,48 @@ paths:
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
   /broadcasts/{id}/send:
     parameters:
       - { $ref: '#/components/parameters/BroadcastIdParam' }
     post:
       tags: [Broadcasts]
       summary: Send a broadcast
-      description: >
-        Moves the broadcast to `send now` (or `send at` when `scheduledFor` is
-        given), gated by the same readiness checks the app runs before letting a
-        broadcast schedule (missing content, missing sender, etc.). On success the
-        broadcast is picked up by the sending pipeline; sending itself is
-        asynchronous. Errors: `broadcast_not_found`, `broadcast_already_sending`
-        (409), `invalid_broadcast`, `broadcast_invalid` (422, readiness gate,
-        carries `issues[]`).
+      description: >-
+        Schedules a prepared broadcast immediately or for scheduledFor and returns 202. It does not
+        wait for planning or delivery. Content is authored in the app. A pre-existing send schedule,
+        started send, or active planning claim returns 409 broadcast_already_sending. Readiness
+        issues return 422 broadcast_invalid with issues. Supports Idempotency-Key. Read runs to
+        inspect recipients; HTTP acceptance is not proof every recipient received email.
       operationId: broadcasts.send
       parameters:
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
       requestBody:
         required: false
         content:
           application/json:
             schema: { $ref: '#/components/schemas/BroadcastSendRequest' }
+            example: {}
       responses:
         '202':
           description: The broadcast was accepted for sending.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema:
@@ -1206,6 +1431,13 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
 
   /broadcasts/{id}/runs:
     parameters:
@@ -1245,8 +1477,8 @@ paths:
       tags: [Broadcasts]
       summary: Get a broadcast's aggregated email metrics
       description: >
-        `email` is omitted entirely when the broadcast has no email content yet.
-        Error: `broadcast_not_found`.
+        `email` is omitted entirely when the broadcast has no email content yet. Error:
+        `broadcast_not_found`.
       operationId: broadcasts.getMetrics
       responses:
         '200':
@@ -1326,32 +1558,45 @@ paths:
     post:
       tags: [Templates]
       summary: Send a template
-      description: >
-        Renders and sends a template to the recipient resolved from `data`
-        (validated against the template's `expectedDataRepresentation`; records
-        referenced by `data` are upserted as a side effect before rendering). The
-        send is synchronous. Warnings are returned in the body's `warnings` array.
-        Supports `Idempotency-Key`. Pre-send validation/eligibility failures throw
-        as request errors, not as a `200` with `status: failed`:
-        `email_limit_reached` (402), `sending_disabled` (422),
-        `template_not_sendable` (400), `domain_not_verified` (422), `invalid_data`
-        (400), `marketing_requires_contact` (422), `recipient_not_subscribed`
-        (422), `recipient_suppressed` (422). A genuine SES send failure instead
-        returns `200` with `status: "failed"` and a generic `error` message (the
-        real failure detail stays server-side).
+      description: >-
+        Requires Write permission and a stable Idempotency-Key. Renders stored template content
+        and sends to the recipient resolved from data. Read expectedDataRepresentation and send
+        every required key; referenced records are upserted before rendering and configured
+        attribute expansions are applied. Available credits and email allowance are required.
+        There is no subject/body replacement or preview execution parameter. A template without
+        an email channel returns template_not_sendable.
+
+
+        Pre-send validation and eligibility failures use request errors (email_limit_reached,
+        sending_disabled, template_not_sendable, domain_not_verified, invalid_data,
+        marketing_requires_contact, recipient_not_subscribed, recipient_suppressed). Records or
+        preparation artifacts can exist before a later failure; an error does not prove that the
+        request made no changes.
+
+
+        HTTP 200 exposes emailId, status, and error. status=sent means the provider accepted the
+        durable send attempt, not inbox delivery. A known terminal refusal or cancellation can
+        return status=failed with a generic error. A temporary dispatch refusal returns
+        429 template_send_retryable with Retry-After. Wait, then retry the same key, template and
+        input. The retry reuses the saved message and recipient. An uncertain delivery or rendering
+        result returns 409 template_send_outcome_unknown without a retry hint. Reconcile it; do not
+        create a new key to force a second send. A confirmed permanent rejection stays failed on
+        retry. Template sends do not return generic response-cache replay headers.
       operationId: templates.send
       parameters:
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+        - $ref: '#/components/parameters/TemplateSendIdempotencyKeyParam'
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/TemplateSendRequest' }
+            example:
+              data:
+                contact:
+                  email: sarah@example.com
       responses:
         '200':
-          description: The send was processed.
-          headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          description: The send was processed. Inspect data.status for the delivery result.
           content:
             application/json:
               schema:
@@ -1360,16 +1605,52 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/TemplateSendResponse' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: The request is invalid, including a missing or blank Idempotency-Key (template_send_operation_required).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >-
+            template_send_operation_conflict means this key was already used with a different
+            template or input. template_send_outcome_unknown means an existing rendering or
+            delivery result needs reconciliation. Neither response authorizes a new send identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: The send or its source data was erased (template_send_erased). The saved operation cannot be retried.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
-        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '429':
+          description: >-
+            The API rate limit or dispatch capacity is temporarily unavailable. For
+            template_send_retryable, the message can already be prepared. Wait for Retry-After,
+            then retry the unchanged request with the same Idempotency-Key.
+          headers:
+            Retry-After:
+              description: Delay before retrying. Dispatch waits use integer seconds; the API rate limiter can use an HTTP date.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '500': { $ref: '#/components/responses/ServerError' }
+        '503':
+          description: >-
+            The send is still processing (template_send_processing), preparation capacity is full
+            (template_send_capacity_in_use), or the space is paused for maintenance. Retry later
+            with the same identity and input. An uncertain provider result instead returns 409.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /webhooks:
     get:
@@ -1400,21 +1681,27 @@ paths:
     post:
       tags: [Webhooks]
       summary: Create a webhook
-      description: >
-        Creates a webhook. The response includes `signatureVerificationSecret`,
-        which is shown here and on rotate-secret only. Save it immediately. A
-        `custom filter` condition generates via AI (in the `ai` rate bucket;
-        credits are checked first) and stores only its human-readable
-        description; the generated expression is never returned. Not
-        Idempotency-Key aware (a secret-returning create). Errors:
-        `invalid_webhook`, `schema_not_found`, `segment_not_found`,
-        `webhook_filter_generation_failed` (422), `insufficient_credits` (402).
+      description: >-
+        Creates an outgoing webhook and returns signatureVerificationSecret. Store the secret
+        securely; normal GET/list responses omit it. Supports Idempotency-Key, including replay of
+        the original secret-bearing response. A custom filter generates through AI from
+        requirements, uses the ai rate bucket and credits, and exposes only its description. Schema
+        accepts an id or slug and must match the trigger. Deliveries retry network failures, HTTP
+        408, 429, and 5xx with bounded backoff; deduplicate their stable X-Webhook-ID. Delivery URL
+        and secret are captured when enqueued, so queued deliveries can use earlier settings. Errors
+        include invalid_webhook, schema_not_found, segment_not_found, and insufficient_credits.
       operationId: webhooks.create
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/WebhookCreate' }
+            example:
+              url: https://example.com/webhooks/maxclicks
+              trigger: contact upserted
+              schemaId: customers
+              condition:
+                type: none
       responses:
         '201':
           description: The created webhook, including its signing secret.
@@ -1426,6 +1713,13 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/WebhookWithSecret' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
@@ -1436,6 +1730,17 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /webhooks/{id}:
     parameters:
@@ -1463,19 +1768,20 @@ paths:
     patch:
       tags: [Webhooks]
       summary: Update a webhook
-      description: >
-        Updates url, email event types, condition, and/or status. Trigger and
-        schema are not updatable (`400 webhook_immutable_field`). Regenerating a
-        `custom filter` condition is an AI call (in the `ai` rate bucket). Errors:
-        `webhook_not_found`, `webhook_integration_owned` (403), `invalid_webhook`,
-        `webhook_immutable_field`, `segment_not_found`,
-        `webhook_filter_generation_failed` (422), `insufficient_credits` (402).
+      description: >-
+        Updates url, emailEventTypes, condition, and/or status (live or paused); at least one is
+        required. Trigger and schema cannot change. A custom filter uses AI and credits. Supports
+        Idempotency-Key. Setting live clears the circuit-breaker count. Already enqueued deliveries
+        keep their captured URL and signing secret. Queued deliveries observed while paused are
+        suppressed rather than held for later replay. Integration-owned webhooks cannot be changed.
       operationId: webhooks.update
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/WebhookUpdate' }
+            example:
+              status: live
       responses:
         '200':
           description: The updated webhook.
@@ -1487,6 +1793,13 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/Webhook' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
@@ -1497,10 +1810,22 @@ paths:
         '422': { $ref: '#/components/responses/UnprocessableEntity' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
     delete:
       tags: [Webhooks]
       summary: Delete a webhook
-      description: "Errors: `webhook_not_found`, `webhook_integration_owned` (403)."
+      description: "Deletes a webhook. Supports Idempotency-Key. Missing webhooks return
+        webhook_not_found; integration-owned webhooks cannot be deleted."
       operationId: webhooks.delete
       responses:
         '200':
@@ -1508,11 +1833,31 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DeletedEnvelope' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /webhooks/{id}/rotate-secret:
     parameters:
@@ -1520,10 +1865,13 @@ paths:
     post:
       tags: [Webhooks]
       summary: Rotate a webhook secret
-      description: >
-        Generates a new signing secret and returns it. The old secret stops
-        verifying immediately. Not Idempotency-Key aware (secret-returning).
-        Errors: `webhook_not_found`, `webhook_integration_owned` (403).
+      description: >-
+        Creates a new signing secret and returns it with the webhook id and updatedAt. Store it
+        securely. Supports Idempotency-Key: retry the same key to recover the original
+        secret-bearing response instead of rotating again. Normal reads never reveal the secret.
+        Already enqueued deliveries retain their captured secret and URL, including retries; keep
+        the previous verification secret until those deliveries drain. Integration-owned webhooks
+        cannot be rotated.
       operationId: webhooks.rotateSecret
       responses:
         '200':
@@ -1536,11 +1884,31 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/RotatedWebhookSecret' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /workflows:
     get:
@@ -1572,9 +1940,9 @@ paths:
   /workflows/{id}:
     x-note: >
       This path also serves `POST /workflows/{workflowStepReference}` (workflows.trigger),
-      registered on the router as a catch-all single-segment POST beneath the more specific
-      routes (list/get/pause/unpause/delete/runs). OpenAPI models both under one templated
-      path item, matching the `/events/{schema}` merge above.
+      registered on the router as a catch-all single-segment POST beneath the more specific routes
+      (list/get/pause/unpause/delete/runs). OpenAPI models both under one templated path item,
+      matching the `/events/{schema}` merge above.
     get:
       tags: [Workflows]
       summary: Get a workflow
@@ -1605,29 +1973,22 @@ paths:
     post:
       tags: [Workflows]
       summary: Trigger a workflow
-      description: >
-        Starts a workflow run from a published incoming-webhook step. The
-        path segment is the step's `workflowStepReference`, not a workflow id
-        (this is the router's catch-all trigger route; see the note on this path
-        item). The body is arbitrary JSON validated server-side against the
-        step's configured JSON schema. On success returns an empty object. Requires
-        `write` permission: the run it starts can send email, spend credits, call AI,
-        mutate records, and issue outbound HTTP requests. Supports
-        `Idempotency-Key`, the recommended way to make retried external webhook
-        deliveries safe. Note: failures from the workflow handler are returned as
-        `text/plain`, while authentication failures use the JSON error envelope.
-        Errors: `workflow_step_not_found` (404, covers a missing/duplicate/
-        unpublished step and a paused workflow, indistinguishable from
-        not-found here), `invalid_request_body` (400, body fails the step's JSON
-        schema).
+      description: >-
+        Starts a run at a published, unpaused incoming-webhook step. The path id is that step’s
+        reference id, not the workflow id. Send the workflow’s configured JSON input as the body.
+        HTTP 200 with data={} confirms run creation, not workflow completion. Errors use the
+        standard JSON error envelope: workflow_step_not_found (404), invalid_request_body (400), or
+        a server error for an invalid configured schema. Supports Idempotency-Key. Workflow
+        authoring, run cancellation, and retry/redrive are not exposed by this public endpoint.
       operationId: workflows.trigger
       parameters:
         - name: id
           in: path
           required: true
           description: The incoming-webhook step's reference id.
-          schema: { type: string }
-        - { $ref: '#/components/parameters/IdempotencyKeyParam' }
+          schema:
+            type: string
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
       requestBody:
         required: true
         content:
@@ -1640,7 +2001,12 @@ paths:
         '200':
           description: The workflow run was started.
           headers:
-            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
           content:
             application/json:
               schema:
@@ -1651,25 +2017,27 @@ paths:
                   data: { type: object }
                   warnings: { $ref: '#/components/schemas/Warnings' }
         '400':
-          description: The body failed the step's JSON schema, or the schema is invalid.
-          content:
-            text/plain:
-              schema: { type: string }
+          $ref: "#/components/responses/BadRequest"
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404':
-          description: No matching, published incoming-webhook step for this reference.
-          content:
-            text/plain:
-              schema: { type: string }
+          $ref: "#/components/responses/NotFound"
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500':
-          description: Server error.
+          $ref: "#/components/responses/ServerError"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
           content:
-            text/plain:
-              schema: { type: string }
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
 
   /workflows/{id}/pause:
     parameters:
@@ -1677,9 +2045,10 @@ paths:
     post:
       tags: [Workflows]
       summary: Pause a workflow
-      description: >
-        Stops new runs from starting; runs already in flight finish normally.
-        Error: `workflow_not_found`.
+      description: >-
+        Pauses the workflow: new triggers and further execution of existing runs are blocked. An
+        external effect already in flight may complete. Supports Idempotency-Key. Error:
+        workflow_not_found.
       operationId: workflows.pause
       responses:
         '200':
@@ -1692,11 +2061,31 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/Workflow' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /workflows/{id}/unpause:
     parameters:
@@ -1704,7 +2093,9 @@ paths:
     post:
       tags: [Workflows]
       summary: Unpause a workflow
-      description: "Error: `workflow_not_found`."
+      description: "Unpauses the workflow so eligible paused work can continue. This does not publish
+        unpublished edits or redrive terminal failed runs. Supports Idempotency-Key. Error:
+        workflow_not_found."
       operationId: workflows.unpause
       responses:
         '200':
@@ -1717,11 +2108,31 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/Workflow' }
                   warnings: { $ref: '#/components/schemas/Warnings' }
+          headers:
+            Idempotent-Replay:
+              $ref: "#/components/headers/IdempotentReplay"
+            Operation-Id:
+              schema:
+                type: string
+              description: Operation identifier for reconciliation.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "503":
+          description: The operation outcome could not be confirmed. Preserve Operation-Id and the original
+            key/body; reconcile before a new operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdempotencyUnknownError"
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyParam"
 
   /workflows/{id}/runs:
     parameters:
@@ -1729,7 +2140,9 @@ paths:
     get:
       tags: [Workflows]
       summary: List a workflow's runs
-      description: "Error: `workflow_not_found`."
+      description: "Lists runs newest first. Each run embeds at most its latest 100 history entries,
+        ascending within that window. Use workflows.getRun with nextHistoryBeforeIndex to read
+        earlier history. Error: workflow_not_found."
       operationId: workflows.listRuns
       parameters:
         - { $ref: '#/components/parameters/LimitParam' }
@@ -1765,7 +2178,13 @@ paths:
     get:
       tags: [Workflows]
       summary: Get a workflow run
-      description: "Errors: `workflow_not_found`, `workflow_run_not_found`."
+      description: "Returns public run status and a window of at most 100 step-history records, ordered by
+        index ascending within the returned window. The initial window contains the latest records.
+        To read older history, pass nextHistoryBeforeIndex as history_before until it is null.
+        status is running while a current step exists; otherwise failed if the run has a failed
+        step, or completed. failureReason comes from the returned window and can be null even for a
+        failed run whose failure is older. No internal step graph, handling state, or input/output
+        data is returned. Errors: workflow_not_found, workflow_run_not_found."
       operationId: workflows.getRun
       responses:
         '200':
@@ -1783,6 +2202,18 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+      parameters:
+        - name: history_before
+          in: query
+          required: false
+          description: Return step-history indices strictly below this non-negative safe integer. Use the
+            previous nextHistoryBeforeIndex; omit for the latest 100 entries.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 9007199254740991
 
   /forms/{formId}/submit:
     parameters:
@@ -1791,14 +2222,16 @@ paths:
       tags: [Forms]
       summary: Submit a form
       description: >
-        Public, unauthenticated form submission (the tenant is derived from the
-        form, not an API key). Validates required fields, CAPTCHA, and consent,
-        then upserts the contact or (for double opt-in, when the visitor opted in
-        to email) stores a pending record and emails a confirmation link. A
-        declined-consent submission always goes through the direct path even on a
-        double opt-in form. Rate limits: per IP 10/60s and per form 120/60s (both
-        fail open if Redis is down), plus a separate per-recipient/per-form cap on
-        confirmation emails. Error: `rate_limit_exceeded`.
+        Public, unauthenticated form submission (the tenant is derived from the form, not an API
+        key). Validates required fields, CAPTCHA, and consent, then upserts the contact or (for
+        double opt-in, when the visitor opted in to email) stores a pending record and emails a
+        confirmation link. A declined-consent submission always goes through the direct path even on
+        a double opt-in form. Rate limits: per IP 10/60s and per form 120/60s (both fail open if
+        Redis is down), plus a separate per-recipient/per-form cap on confirmation emails. Error:
+        `rate_limit_exceeded`. A direct submission that needs missing AI auto-fill values requires
+        a timed submissionId. Retain it across network and CAPTCHA retries; do not generate a new
+        ID for an unanswered request. The ID uses the same format and retry window as timed record
+        Idempotency-Key values. Confirmation has its own persisted server identity and token expiry.
       operationId: forms.submit
       security: []
       requestBody:
@@ -1806,6 +2239,11 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/FormSubmission' }
+            example:
+              contact:
+                email: sarah@example.com
+                firstName: Sarah
+              emailMarketingConsent: false
       responses:
         '200':
           description: The submission was accepted.
@@ -1819,6 +2257,7 @@ paths:
                   warnings: { $ref: '#/components/schemas/Warnings' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Gone' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -1836,11 +2275,10 @@ paths:
       tags: [Forms]
       summary: Confirm a double opt-in
       description: >
-        Public browser navigation target for the double opt-in email link.
-        Redeems the token, upserts the confirmed contact, and always redirects
-        (302) to the hosted result page. Every failure path (missing/expired
-        token, unpublished form) also redirects to a "failed" landing page rather
-        than returning a JSON error. Same rate limits as `forms.submit`.
+        Public browser navigation target for the double opt-in email link. Redeems the token,
+        upserts the confirmed contact, and always redirects (302) to the hosted result page. Every
+        failure path (missing/expired token, unpublished form) also redirects to a "failed" landing
+        page rather than returning a JSON error. Same rate limits as `forms.submit`.
       operationId: forms.confirmDoubleOptIn
       security: []
       responses:
@@ -1862,9 +2300,9 @@ paths:
       tags: [Emails]
       summary: One-click unsubscribe
       description: >
-        Public RFC 8058 one-click unsubscribe target. Unsubscribes the linked
-        contact from a topic or the whole email channel, then redirects (302) to
-        the hosted result page. No rate limit at all on this endpoint.
+        Public RFC 8058 one-click unsubscribe target. Unsubscribes the linked contact from a topic
+        or the whole email channel, then redirects (302) to the hosted result page. No rate limit at
+        all on this endpoint.
       operationId: emails.unsubscribeOneClick
       security: []
       requestBody:
@@ -1887,6 +2325,203 @@ paths:
               schema: { type: string, format: uri }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /events/{schema}/{id}/status:
+    get:
+      tags:
+        - Events
+      summary: Get event readiness
+      operationId: events.status
+      description: Read the current readiness of an accepted event by its maxclicks event id, including
+        pending, ready, failed, and outcome_unknown states. This is distinct from the immutable
+        readinessAtAcceptance returned when firing or retrying the event. data contains raw
+        acceptance values until preparation is ready. A missing event or event schema returns 404.
+        Acceptance and readiness do not prove that a downstream workflow, webhook, or email
+        completed.
+      parameters:
+        - name: schema
+          in: path
+          required: true
+          description: Event schema id or slug.
+          schema:
+            type: string
+            example: purchase-completed
+        - name: id
+          in: path
+          required: true
+          description: The maxclicks event id from the acceptance receipt, not your eventId.
+          schema:
+            type: string
+            example: ev_BcwDvBUeSaSDILA5tHgpmU7I
+      responses:
+        "200":
+          description: Current event readiness and accepted/prepared data.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EventStatus"
+                  warnings:
+                    $ref: "#/components/schemas/Warnings"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /event-identities:
+    post:
+      tags:
+        - Events
+      summary: Bind an anonymous event identity
+      operationId: eventIdentities.identify
+      description: Binds or unbinds an anonymous browser identity to a contact using a server-held API key
+        with write permission. An enabled contact track definition must match sourceId and
+        subjectSchemaId in the space. Send contactId=null to remove the binding. All six body fields
+        are required and unknown fields are rejected. Use a UUID operationId for replay of the same
+        input; a changed body under that operationId returns 409. expectedAliasRevision is the last
+        revision of this specific alias as a decimal string, or "0" for a new alias. Keep the
+        returned identityRevision for the next change to that alias. Revision conflicts and erased
+        aliases return 409; an unavailable source returns 403. Capacity is bounded at 100,000
+        aliases and 1,000,000 changes per space; exhausted capacity returns 429 without promising
+        automatic recovery. Idempotency-Key is not used.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EventIdentityInput"
+      responses:
+        "200":
+          description: The committed identity revision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: "#/components/schemas/EventIdentityResult"
+                  warnings:
+                    $ref: "#/components/schemas/Warnings"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /record-deletions/{operationId}:
+    get:
+      tags:
+        - Records
+      summary: Get record deletion status
+      operationId: records.getDeletion
+      description: >-
+        Poll a record-deletion operation in the caller's space. pending means drain, cancellation
+        or cleanup is unfinished; inspect message for the current phase. blocked needs reconciliation;
+        completed confirms deletion, and cancelled confirms cancellation before record removal.
+        A missing or out-of-scope operation returns 404. Preserve operationId from records.delete.
+        This read-only response reports canCancel=false; cancellation eligibility is enforced
+        separately by records.cancelDeletion against the current requester and operation phase.
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          description: The full operationId returned by records.delete.
+          schema:
+            type: string
+            example: delete:records:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      responses:
+        "200":
+          description: Current deletion status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - data
+                properties:
+                  data:
+                    $ref: "#/components/schemas/RecordDeletionStatus"
+                  warnings:
+                    $ref: "#/components/schemas/Warnings"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /record-deletions/{operationId}/cancel:
+    post:
+      tags: [Records]
+      summary: Cancel a record deletion before removal
+      operationId: records.cancelDeletion
+      description: >-
+        Requests cancellation during the initial admission-drain phase, before data removal begins.
+        Requires the original requesting user and current Write permission in the workspace.
+        Returns 202 while collection intake retirement is acknowledged, then 200 for an already
+        cancelled operation. Poll records.getDeletion until status=cancelled. Repeating cancellation
+        during cancellation or after it completes returns the current operation status. There is no
+        separate Idempotency-Key for this route: operationId identifies the existing operation.
+        A different requester or out-of-scope operation returns 404. Removal already begun returns
+        409; a currently leased admission check also returns 409 and requires waiting before retrying.
+        Cancellation cannot restore data after removal begins.
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          description: The full operationId returned by records.delete.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The operation was already cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/RecordDeletionStatus' }
+        '202':
+          description: Cancellation is pending; poll the deletion operation.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/RecordDeletionStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
 
 components:
   securitySchemes:
@@ -1894,15 +2529,39 @@ components:
       type: http
       scheme: bearer
       description: >
-        Your API key sent as a bearer token in the `Authorization` header:
-        `Authorization: Bearer <api_key>`. The server also accepts the raw key
-        without the `Bearer ` prefix, but clients should always send `Bearer`.
+        Your API key sent as a bearer token in the `Authorization` header: `Authorization: Bearer
+        <api_key>`. The server also accepts the raw key without the `Bearer ` prefix, but clients
+        should always send `Bearer`.
+    oauth2:
+      type: oauth2
+      description: >
+        An OAuth 2.1 access token for a connection the user approved for one workspace, sent as
+        `Authorization: Bearer <access_token>`. Discover the server from
+        https://api.maxclicks.ai/.well-known/oauth-authorization-server or from the
+        `resource_metadata` in any 401 `WWW-Authenticate` header. Identify the app with a Client ID
+        Metadata Document, using the https URL of a JSON document it publishes as its `client_id`
+        (`client_id_metadata_document_supported`), or register with dynamic client registration at
+        https://api.maxclicks.ai/oauth/register. Authorization requires PKCE with
+        S256 and accepts `resource` (https://api.maxclicks.ai/v1 for this API). Access tokens last one
+        hour; refresh tokens rotate on every use, and presenting an old one again ends the
+        connection. An operation needs the scope matching its permission: `read` for list and
+        retrieve, `write` for changes and sends, `admin` for suppressions. A missing scope answers
+        403 `insufficient_scope`.
+      flows:
+        authorizationCode:
+          authorizationUrl: https://api.maxclicks.ai/oauth/authorize
+          tokenUrl: https://api.maxclicks.ai/oauth/token
+          refreshUrl: https://api.maxclicks.ai/oauth/token
+          scopes:
+            read: Read records, events, segments, templates, campaigns, workflows and sending setup.
+            write: Create and change records, fire events, send templates and broadcasts, and run workflows.
+            admin: Add and remove email suppressions.
 
   headers:
     IdempotentReplay:
       description: >
-        Present and `true` when this response was replayed verbatim from a
-        prior request that used the same `Idempotency-Key`.
+        Present and `true` when this response was replayed verbatim from a prior request that used
+        the same `Idempotency-Key`.
       schema: { type: boolean }
 
   parameters:
@@ -1920,11 +2579,11 @@ components:
       name: offset
       in: query
       required: false
-      description: >
-        Rows to skip. Values below 0 are clamped to 0 with a warning. A value
-        above 10000 is rejected outright with `400 offset_too_large` rather than
-        clamped, so a client cannot silently loop forever past the cap; narrow
-        the query instead of paging past it.
+      description: >-
+        Rows to skip. Negative values clamp to 0 with a warning; above 10000 returns 400
+        offset_too_large. pagination.hasMore becomes false when the next offset reaches the cap even
+        if totalCount is larger. Records list has no ad-hoc filter; this is not an unlimited export
+        contract.
       schema:
         type: integer
         default: 0
@@ -1934,10 +2593,50 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      description: >
-        A client-generated key that makes retries of this request safe. See the
-        Idempotency-Key section of the top-level description.
-      schema: { type: string }
+      description: >-
+        Stable key for one logical write, maximum 256 characters. Scoped to calling API key, method,
+        and resolved path, with a canonical request-body fingerprint. Replays recorded status/body
+        with Idempotent-Replay=true. Failed record create/upsert requests retain status and stable
+        error code with a constant message; detailed validation information is only in the first
+        authorized response. Follow the code's retry policy, rather than creating a new key
+        from the HTTP status alone. Changed input returns 422
+        idempotency_key_reused; active work returns 409 idempotency_conflict; unresolved work
+        returns idempotency_outcome_unknown. Ordinary opaque keys keep their existing 24-hour
+        completed-response retention. For record create/upsert that needs missing AI auto-fill,
+        use rpi1.<13-digit Unix milliseconds>.<UUIDv4>. The rpi1. prefix is reserved for timed
+        record keys and is checked before cached-response replay. Its retry window ends 24 hours
+        after the issue time rounded up to the next minute. A clock more than five minutes ahead
+        is refused. Expired keys are permanently refused, including after receipt cleanup.
+        An expired or unknown result must be reconciled; do not automatically mint a new key.
+        Unresolved financial/provider work remains retained. Erased record responses return 410
+        instead of replaying private data. Other idempotent operations keep their own key rules.
+      schema: { type: string, maxLength: 256 }
+    RecordDeletionAttemptKeyParam:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Stable identity for this explicit deletion attempt. Keep the same key to recover its
+        operation status. This does not use generic response caching or replay headers. A new
+        attempt after cancellation requires a new key; inspect the original operation first.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
+    TemplateSendIdempotencyKeyParam:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Non-blank identity for one template send. Keep the same API key, template and input when
+        retrying. The identity is scoped to the space and calling API key; using it for a different
+        template or input returns 409 template_send_operation_conflict. A retry resumes the saved
+        preparation or delivery and reuses its exact message and recipient. It does not replay a
+        generic cached HTTP response, return Idempotent-Replay or Operation-Id, or permit key reuse
+        after the generic 24-hour response-cache period. An erased request returns 410
+        template_send_erased. An unknown result needs reconciliation; do not mint a replacement key.
+      schema: { type: string, minLength: 1, pattern: '\S' }
     SchemaParam:
       name: schema
       in: path
@@ -2008,19 +2707,23 @@ components:
   responses:
     BadRequest:
       description: >
-        The request was malformed or failed validation. Also covers
-        `malformed_json` (body is not valid JSON) and, on list endpoints,
-        `offset_too_large`.
+        The request was malformed or failed validation. Also covers `malformed_json` (body is not
+        valid JSON) and, on list endpoints, `offset_too_large`.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Unauthorized:
-      description: The API key is missing or invalid.
+      description: >
+        The credential is missing or invalid: `invalid_api_key` for an API key, `invalid_access_token`
+        for an expired or revoked OAuth access token. The `WWW-Authenticate` header names the
+        resource metadata, from which an OAuth client finds the authorization server.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Forbidden:
-      description: The key lacks permission, or the space is out of scope.
+      description: >
+        The key lacks permission, or the space is out of scope. An OAuth connection whose user holds
+        the permission but did not grant it answers `insufficient_scope`.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -2034,27 +2737,38 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    Gone:
+      description: The record operation expired or its stored response was erased. Reconcile the original operation before starting a new one.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     PaymentRequired:
       description: >
-        Insufficient credits (`insufficient_credits`) for an AI-generation call
-        or a schema with AI auto-fill, or the space's email allowance is
-        exhausted (`email_limit_reached`).
+        Insufficient credits (`insufficient_credits`) for an AI-generation call or a schema with AI
+        auto-fill, or the space's email allowance is exhausted (`email_limit_reached`).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     UnprocessableEntity:
       description: >
-        The request was well-formed but could not be processed, typically a
-        failed AI-generation call or a readiness gate (which may carry
-        `error.issues`).
+        The request was well-formed but could not be processed, typically a failed AI-generation
+        call or a readiness gate (which may carry `error.issues`).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     TooManyRequests:
-      description: The rate limit was exceeded.
+      description: A request rate or capacity limit was reached. Follow the error code and Retry-After; a capacity refusal can follow durable preparation.
       headers:
         Retry-After:
-          description: When to retry, as an HTTP date.
+          description: Retry delay as HTTP-date or seconds when supplied. Event per-item admission failures
+            report retryAfterMilliseconds inside the result instead.
+          schema: { type: string }
+        RateLimit-Policy:
+          description: Each limit that applies, as `"<bucket>";q=<quota>;w=<window seconds>` (draft-ietf-httpapi-ratelimit-headers).
+            Sent on every rate-limited response, not only on 429.
+          schema: { type: string }
+        RateLimit:
+          description: Quota left under each limit, as `"<bucket>";r=<remaining>;t=<seconds until reset>`.
           schema: { type: string }
       content:
         application/json:
@@ -2071,10 +2785,9 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     IngestUnavailable:
       description: >
-        A downstream event dependency is unavailable: the ingest pipeline
-        (`ingest_unavailable`, on `events.fire`/`events.fireBatch`) or the
-        ClickHouse-backed event archive (`event_archive_unavailable`, on
-        `events.list`).
+        A downstream event dependency is unavailable: the ingest pipeline (`ingest_unavailable`, on
+        `events.fire`/`events.fireBatch`) or the ClickHouse-backed event archive
+        (`event_archive_unavailable`, on `events.list`).
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -2100,8 +2813,8 @@ components:
         issues:
           type: array
           description: >
-            Present only for validation-gate failures that report more than one
-            distinct problem at once (e.g. `broadcasts.send`'s `broadcast_invalid`).
+            Present only for validation-gate failures that report more than one distinct problem at
+            once (e.g. `broadcasts.send`'s `broadcast_invalid`).
           items: { type: string }
 
     Error:
@@ -2114,6 +2827,7 @@ components:
       type: array
       description: Non-fatal warnings accumulated while processing the request.
       items: { type: string }
+      example: []
 
     Pagination:
       type: object
@@ -2122,7 +2836,10 @@ components:
         limit: { type: integer }
         offset: { type: integer }
         totalCount: { type: integer }
-        hasMore: { type: boolean }
+        hasMore:
+          type: boolean
+          description: True only when more rows exist AND offset + limit is below 10000. False can reflect the
+            traversal cap even if totalCount is larger; it does not guarantee a full export.
 
     CursorPagination:
       type: object
@@ -2172,14 +2889,33 @@ components:
       type: string
       description: A display color for tags and topics.
       enum:
-        [red, orange, amber, yellow, lime, green, emerald, teal, cyan, sky, blue, indigo, violet, purple, fuchsia, pink, rose, zinc]
+        [
+          red,
+          orange,
+          amber,
+          yellow,
+          lime,
+          green,
+          emerald,
+          teal,
+          cyan,
+          sky,
+          blue,
+          indigo,
+          violet,
+          purple,
+          fuchsia,
+          pink,
+          rose,
+          zinc
+        ]
 
     SuppressionReason:
       type: string
       description: >
-        All possible suppression reasons on read. Only `manual` and `legal` can
-        be created or removed through the API; the rest are system-applied
-        (bounce, complaint, unsubscribe) and read-only.
+        All possible suppression reasons on read. Only `manual` and `legal` can be created or
+        removed through the API; the rest are system-applied (bounce, complaint, unsubscribe) and
+        read-only.
       enum: [manual, legal, unsubscribed, hard_bounce, soft_bounce_consecutive, spam_complaint]
 
     SuppressionCreateReason:
@@ -2192,7 +2928,7 @@ components:
 
     Me:
       type: object
-      required: [apiKey, user, space, role]
+      required: [apiKey, user, space, role, oauth]
       properties:
         apiKey:
           type: object
@@ -2221,11 +2957,42 @@ components:
             name: { $ref: '#/components/schemas/RoleName' }
             label: { type: string }
             description: { type: string }
+        oauth:
+          type: [object, 'null']
+          description: >
+            Present for an OAuth access token and null for an API key. For an OAuth connection,
+            `apiKey` describes the connection itself, named after the app.
+          required: [clientId, resource, scopes, expiresAt]
+          properties:
+            clientId:
+              type: string
+              description: >
+                The OAuth client the connection was granted to: its registered id, or the URL of its
+                Client ID Metadata Document.
+            resource:
+              type: string
+              format: uri
+              description: The resource the token was issued for, the MCP server or this API.
+            scopes:
+              type: array
+              items: { type: string, enum: [read, write, admin] }
+            expiresAt: { type: string, format: date-time }
 
     Schema:
       type: object
       required:
-        [id, type, slug, name, namePlural, description, integrationVendorName, attributeCount, createdAt, updatedAt]
+        [
+          id,
+          type,
+          slug,
+          name,
+          namePlural,
+          description,
+          integrationVendorName,
+          attributeCount,
+          createdAt,
+          updatedAt
+        ]
       properties:
         id: { type: string }
         type: { $ref: '#/components/schemas/SchemaType' }
@@ -2242,17 +3009,14 @@ components:
 
     AttributeDefinition:
       type: object
-      description: >
-        A stored or evaluated attribute definition. `type` discriminates the
-        shape, and `nullable` is present on every stored definition. `evaluated`
-        attributes are computed rather than stored; their generated expression is
-        never returned. Additional properties vary by type and sub-format.
-
-
-        Note that `url`, `email` and `phone` are not types: they are `format`
-        values on `type: string`. Nested structures are not types either: they are
-        expressed as `type: json` with a `jsonSchema`. There is no `object` or
-        `object array` type.
+      description: >-
+        Attribute definition metadata. Stored definitions carry nullable; evaluated definitions use
+        target=schema or json. An aggregate keeps a stored type and adds valueSource.type=aggregate;
+        it is not writable. Writable stored fields have no valueSource. Optional autoFill uses
+        mode=default with defaultValue, or mode=ai with optional prompt. Evaluated and aggregate
+        values require app/runtime expansion and are not included in public record reads. Types
+        url/email/phone/ref/object do not exist; use string formats and json as documented.
+        Generated evaluated expressions are never returned.
       required: [type]
       properties:
         type:
@@ -2277,16 +3041,54 @@ components:
         format:
           type: string
           description: >
-            On `type: string` only. With `multiLine` false or absent: `plain text`,
-            `email`, `phone` or `url`. With `multiLine: true`: `plain text` or `code`.
+            On `type: string` only. With `multiLine` false or absent: `plain text`, `email`, `phone`
+            or `url`. With `multiLine: true`: `plain text` or `code`.
         jsonSchema:
           type: object
           description: "On `type: json` only. A simplified JSON Schema, including for nested structures."
+        autoFill:
+          type: object
+          description: "Stored field: mode default with defaultValue, or mode ai with optional prompt."
+          additionalProperties: true
+        valueSource:
+          type: object
+          description: "Aggregate metadata: type=aggregate; eventSchemaId identifies
+            the source Event schema;
+            specification(operation=count|sum|latest,valueProperty,dimensionProperty,filter,windowS\
+            econds); cadenceSeconds,enabled,revision. Makes this stored type non-writable."
+          additionalProperties: true
+        target:
+          type: string
+          enum:
+            - schema
+            - json
+          description: Evaluated only. schema requires
+            schemaId,cardinality,requirements,queryDescriptionMarkdown,expressionReferences. json
+            requires
+            jsonSchema,requirements,descriptionMarkdown,expressionReferences,expressionOutput=json|query.
+        cardinality:
+          type: string
+          enum:
+            - one
+            - many
+        schemaId:
+          type: string
       additionalProperties: true
 
     Attribute:
       type: object
-      required: [id, key, label, description, sequence, definition, integrationVendorName, createdAt, updatedAt]
+      required:
+        [
+          id,
+          key,
+          label,
+          description,
+          sequence,
+          definition,
+          integrationVendorName,
+          createdAt,
+          updatedAt
+        ]
       properties:
         id:
           type: string
@@ -2316,7 +3118,8 @@ components:
 
     ContactRecord:
       type: object
-      description: A contact record. Custom attribute values are spread onto the top level.
+      description: Contact record. Stored custom values are top-level; platform fields override colliding
+        keys. Evaluated/aggregate values are not expanded by public record reads.
       required:
         - id
         - schemaId
@@ -2368,7 +3171,8 @@ components:
 
     ObjectRecord:
       type: object
-      description: An object record. Custom attribute values are spread onto the top level.
+      description: Object record. Stored custom values are top-level; platform fields override colliding
+        keys. Evaluated/aggregate values are not expanded by public record reads.
       required: [id, schemaId, schemaSlug, externalId, notes, tags, createdAt, updatedAt]
       properties:
         id: { type: string }
@@ -2384,7 +3188,8 @@ components:
       additionalProperties: true
 
     Record:
-      description: A contact or object record.
+      description: Contact or object record with stored custom values and platform fields flattened at the
+        top level. Public record reads do not expand evaluated or aggregate attribute values.
       oneOf:
         - { $ref: '#/components/schemas/ContactRecord' }
         - { $ref: '#/components/schemas/ObjectRecord' }
@@ -2392,10 +3197,9 @@ components:
     RecordInput:
       type: object
       description: >
-        Input for creating, upserting, or updating a record. All fields are
-        optional. For a contact schema the contact fields apply; for an object
-        schema the object fields apply. Custom attribute keys are passed at the
-        top level.
+        Input for creating, upserting, or updating a record. All fields are optional. For a contact
+        schema the contact fields apply; for an object schema the object fields apply. Custom
+        attribute keys are passed at the top level.
       properties:
         id: { type: string }
         fullName: { type: [string, 'null'] }
@@ -2463,9 +3267,8 @@ components:
         actorIdentifier: { type: [string, 'null'] }
         context:
           description: >
-            Raw JSON context (consent text/version, IP, user agent, source URL,
-            form id, timestamp). `ipAddress` and `userAgent` are stripped before
-            being returned.
+            Raw JSON context (consent text/version, IP, user agent, source URL, form id, timestamp).
+            `ipAddress` and `userAgent` are stripped before being returned.
 
     SuppressionInput:
       type: object
@@ -2496,8 +3299,8 @@ components:
         affectedContactCount:
           type: integer
           description: >
-            Present only on `suppressions.create` and `suppressions.batchCreate`
-            responses: contacts in the space whose identifier matched.
+            Present only on `suppressions.create` and `suppressions.batchCreate` responses: contacts
+            in the space whose identifier matched.
 
     SuppressionBatchCreateRequest:
       type: object
@@ -2513,8 +3316,8 @@ components:
       type: object
       required: [index, status]
       description: >
-        Suppression fields are present when `status` is `created` or `exists`;
-        `error` is present when `status` is `failed`.
+        Suppression fields are present when `status` is `created` or `exists`; `error` is present
+        when `status` is `failed`.
       allOf:
         - type: object
           properties:
@@ -2576,24 +3379,68 @@ components:
 
     EventInput:
       type: object
-      description: A flat event input. Any `id` is ignored on fire. Custom attribute keys are passed at the top level.
+      description: Flat event acceptance input. Custom writable attribute keys are top-level and
+        normalized against the event schema. Any id is ignored on fire. Reserved readiness fields
+        are not caller-controlled. Supply eventId for retry deduplication. The normalized input has
+        a 256 KiB ceiling.
       properties:
         eventId:
           type: [string, 'null']
-          description: Deduplication key.
+          description: Caller-owned occurrence identifier, scoped to the space and event schema. Reuse with
+            identical input and occurredAt for retries. If omitted or null, the server generates a
+            UUID; save the returned eventId. A changed payload under the same value returns
+            event_id_conflict.
         occurredAt:
           type: string
           format: date-time
-          description: When the event actually happened.
+          description: When the event occurred. Defaults to acceptance time; explicit values must be no more
+            than 366 days old or five minutes in the future. Preserve the same explicit value on
+            retries.
+        contactId:
+          type:
+            - string
+            - "null"
+          description: Explicit contact subject id in this space. Mutually exclusive with objectId.
+        objectId:
+          type:
+            - string
+            - "null"
+          description: Explicit object subject id in this space. Mutually exclusive with contactId.
       additionalProperties: true
 
     FireResult:
       type: object
-      required: [accepted]
+      required:
+        - accepted
+        - id
+        - eventId
+        - isDuplicate
+        - readinessAtAcceptance
       properties:
         accepted:
           type: integer
-          description: Number of events accepted by the ingest pipeline.
+          const: 1
+          description: One event occurrence was durably accepted or replayed.
+        id:
+          type: string
+          description: maxclicks event id; use it with events.status.
+        eventId:
+          type: string
+          description: Caller-supplied or generated occurrence identifier.
+        isDuplicate:
+          type: boolean
+        readinessAtAcceptance:
+          type: string
+          enum:
+            - pending
+            - ready
+          description: Immutable original acceptance state. Poll events.status for current readiness.
+      example:
+        accepted: 1
+        id: ev_BcwDvBUeSaSDILA5tHgpmU7I
+        eventId: order_1042_paid
+        isDuplicate: false
+        readinessAtAcceptance: pending
 
     BatchFireItemResult:
       type: object
@@ -2602,8 +3449,28 @@ components:
         index: { type: integer }
         status:
           type: string
-          enum: [accepted, failed]
+          enum:
+            - accepted
+            - failed
+            - rolled_back
         error: { $ref: '#/components/schemas/ErrorObject' }
+        id:
+          type: string
+        eventId:
+          type:
+            - string
+            - "null"
+        isDuplicate:
+          type: boolean
+        readinessAtAcceptance:
+          type: string
+          enum:
+            - pending
+            - ready
+        retryAfterMilliseconds:
+          type: integer
+          minimum: 0
+          description: Present on an event-admission failure; delay before retrying that occurrence.
 
     BatchFireResult:
       type: object
@@ -2620,7 +3487,19 @@ components:
             failed: { type: integer }
         failedIndex:
           type: integer
-          description: Present only on an abort response, pointing at the first invalid item.
+          description: Present on abort. Index of the item whose failure stopped processing; later items were
+            not attempted.
+      example:
+        results:
+          - index: 0
+            status: accepted
+            id: ev_BcwDvBUeSaSDILA5tHgpmU7I
+            eventId: order_1042_paid
+            isDuplicate: false
+            readinessAtAcceptance: pending
+        summary:
+          accepted: 1
+          failed: 0
 
     EventBatchRequest:
       type: object
@@ -2638,14 +3517,55 @@ components:
 
     Event:
       type: object
-      description: A fired event. Custom attribute values are spread onto the top level.
-      required: [id, schemaId, schemaSlug, eventId, createdAt]
+      description: A ready business event. Custom stored values are flattened into the top level. Pending
+        or failed acceptances are available through events.status instead.
+      required:
+        - id
+        - schemaId
+        - schemaSlug
+        - eventId
+        - createdAt
+        - receivedAt
+        - occurredAt
+        - readyAt
+        - readinessState
+        - definitionRevision
+        - contactId
+        - objectId
       properties:
         id: { type: string }
         schemaId: { type: string }
         schemaSlug: { type: string }
         eventId: { type: [string, 'null'] }
         createdAt: { type: string, format: date-time }
+        receivedAt:
+          type: string
+          format: date-time
+        occurredAt:
+          type: string
+          format: date-time
+        readyAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        readinessState:
+          type: string
+          enum:
+            - pending
+            - ready
+            - failed
+            - outcome_unknown
+        definitionRevision:
+          type: string
+        contactId:
+          type:
+            - string
+            - "null"
+        objectId:
+          type:
+            - string
+            - "null"
       additionalProperties: true
 
     DnsRecord:
@@ -2702,12 +3622,24 @@ components:
         channel: { $ref: '#/components/schemas/CommunicationChannel' }
         private:
           type: boolean
-          description: Private topics only appear in the contact preferences page if the contact has been granted access.
+          description: Private topics only appear in the contact preferences page if the contact has been
+            granted access.
 
     Segment:
       type: object
       required:
-        [id, createdAt, updatedAt, name, description, contactSchemaId, contactSchemaSlug, requirements, conditionDescriptionMarkdown, integrationVendorName]
+        [
+          id,
+          createdAt,
+          updatedAt,
+          name,
+          description,
+          contactSchemaId,
+          contactSchemaSlug,
+          requirements,
+          conditionDescriptionMarkdown,
+          integrationVendorName
+        ]
       properties:
         id: { type: string }
         createdAt: { type: string, format: date-time }
@@ -2721,14 +3653,15 @@ components:
           description: The refined natural-language specification used to generate the condition.
         conditionDescriptionMarkdown:
           type: string
-          description: Human-readable markdown description of the condition. The generated expression itself is never returned.
+          description: Human-readable markdown description of the condition. The generated expression itself
+            is never returned.
         integrationVendorName: { type: [string, 'null'] }
         matchingCount:
           type: integer
           description: >
-            Present when the segment was just created, or just updated with new
-            `requirements`; omitted otherwise. A live count at that moment, not
-            kept in sync afterward (call `segments.count` for the current value).
+            Present when the segment was just created, or just updated with new `requirements`;
+            omitted otherwise. A live count at that moment, not kept in sync afterward (call
+            `segments.count` for the current value).
 
     SegmentCreate:
       type: object
@@ -2740,7 +3673,8 @@ components:
         requirements: { type: string, description: Natural-language description of the filter criteria. }
 
     TemplateFrom:
-      description: "A sender: either a verified domain with a manual slug and display name, or a saved sender profile."
+      description: "A sender: either a verified domain with a manual slug and display name, or a saved
+        sender profile."
       oneOf:
         - type: object
           required: [type, domainId, code]
@@ -2762,10 +3696,9 @@ components:
 
     DataRepresentationProperty:
       description: >
-        One property of a data representation. `record` properties reference
-        records from a schema; `json` properties are plain JSON values described
-        by a JSON schema. `schema` accepts an id or slug on input; responses
-        always echo the slug.
+        One property of a data representation. `record` properties reference records from a schema;
+        `json` properties are plain JSON values described by a JSON schema. `schema` accepts an id
+        or slug on input; responses always echo the slug.
       oneOf:
         - type: object
           required: [key, type, schema]
@@ -2788,7 +3721,21 @@ components:
     Template:
       type: object
       required:
-        [id, createdAt, updatedAt, name, description, transactional, contentFormat, contentEditor, content, from, recipientDataPath, expectedDataRepresentation, communicationTopicId]
+        [
+          id,
+          createdAt,
+          updatedAt,
+          name,
+          description,
+          transactional,
+          contentFormat,
+          contentEditor,
+          content,
+          from,
+          recipientDataPath,
+          expectedDataRepresentation,
+          communicationTopicId
+        ]
       properties:
         id: { type: string }
         createdAt: { type: string, format: date-time }
@@ -2827,10 +3774,9 @@ components:
         data:
           type: object
           description: >
-            Payload keyed by the template's expected data-representation
-            properties. Minimal identifiers suffice for record properties (e.g.
-            `{ "email": "user@example.com" }` for a contact); the platform
-            finds-or-creates the record, then reads it back for rendering.
+            Payload keyed by the template's expected data-representation properties. Minimal
+            identifiers suffice for record properties (e.g. `{ "email": "user@example.com" }` for a
+            contact); the platform finds-or-creates the record, then reads it back for rendering.
           additionalProperties: true
 
     TemplateSendResponse:
@@ -2871,8 +3817,8 @@ components:
     BroadcastAudienceInput:
       description: >
         The audience to point a broadcast at: everyone in its contact schema, or an existing
-        segment. A `custom filter` audience is authored in the maxclicks app, where a human
-        reviews the generated condition before it drives a mass send, and cannot be set here.
+        segment. A `custom filter` audience is authored in the maxclicks app, where a human reviews
+        the generated condition before it drives a mass send, and cannot be set here.
       oneOf:
         - type: object
           required: [type]
@@ -2887,7 +3833,22 @@ components:
     Broadcast:
       type: object
       required:
-        [id, createdAt, updatedAt, name, description, contactSchemaId, contactSchemaSlug, schedulingStatus, scheduledFor, sendingStartedAt, sendingFinishedAt, failureReason, audience, hasContent]
+        [
+          id,
+          createdAt,
+          updatedAt,
+          name,
+          description,
+          contactSchemaId,
+          contactSchemaSlug,
+          schedulingStatus,
+          scheduledFor,
+          sendingStartedAt,
+          sendingFinishedAt,
+          failureReason,
+          audience,
+          hasContent
+        ]
       properties:
         id: { type: string }
         createdAt: { type: string, format: date-time }
@@ -2904,14 +3865,15 @@ components:
         audience: { $ref: '#/components/schemas/BroadcastAudience' }
         hasContent:
           type: boolean
-          description: "Never includes the underlying email content itself (e.g. raw Adaptyle markup), only this boolean summary."
+          description: "Never includes the underlying email content itself (e.g. raw Adaptyle markup), only
+            this boolean summary."
 
     BroadcastUpdate:
       type: object
       description: >
-        At least one field must be provided. Only `name`/`description`/
-        `audience`/`scheduledFor` are updatable; content is not editable through
-        this endpoint. Rejected once sending has started.
+        At least one field must be provided. Only `name`/`description`/ `audience`/`scheduledFor`
+        are updatable; content is not editable through this endpoint. Rejected once sending has
+        started.
       properties:
         name: { type: [string, 'null'] }
         description: { type: [string, 'null'] }
@@ -2948,10 +3910,29 @@ components:
                 bounced: { type: boolean }
                 complained: { type: boolean }
             - type: 'null'
+      description: "A narrow public delivery projection. status is derived from email presence and
+        delivery fields: no associated email is reported failed; email sentAt is sent;
+        send/rejection error is failed; otherwise pending. This is not the complete internal
+        planning, credit, quality-pause, or redrive state. An unsent email object can remain pending
+        while operational work waits."
 
     EmailAggregatedMetrics:
       type: object
-      required: [sent, delivered, bounced, deliveryDelays, rejected, failed, complained, unsubscribed, opens, uniqueOpens, clicks, uniqueClicks]
+      required:
+        [
+          sent,
+          delivered,
+          bounced,
+          deliveryDelays,
+          rejected,
+          failed,
+          complained,
+          unsubscribed,
+          opens,
+          uniqueOpens,
+          clicks,
+          uniqueClicks
+        ]
       properties:
         sent: { type: integer }
         delivered: { type: integer }
@@ -3002,7 +3983,8 @@ components:
       enum: [live, paused, circuit breaker]
 
     WebhookCondition:
-      description: The webhook's resolved filter condition. The generated expression is never returned, only its description.
+      description: The webhook's resolved filter condition. The generated expression is never returned,
+        only its description.
       oneOf:
         - type: object
           required: [type]
@@ -3021,9 +4003,8 @@ components:
 
     WebhookConditionInput:
       description: >
-        The filter condition to create or update a webhook with. A `custom
-        filter` condition generates via AI from `requirements` (billed, `ai`
-        rate bucket).
+        The filter condition to create or update a webhook with. A `custom filter` condition
+        generates via AI from `requirements` (billed, `ai` rate bucket).
       oneOf:
         - type: object
           required: [type]
@@ -3079,7 +4060,8 @@ components:
         lastCallErrorMessage: { type: [string, 'null'] }
         integrationVendorName:
           type: [string, 'null']
-          description: Non-null means the webhook is integration-owned and cannot be updated, deleted, or rotated.
+          description: Non-null means the webhook is integration-owned and cannot be updated, deleted, or
+            rotated.
 
     WebhookWithSecret:
       allOf:
@@ -3141,7 +4123,14 @@ components:
 
     WorkflowRunStepHistoryRecord:
       type: object
-      required: [stepId, stepLabel, slotKey, enteredAt, leftAt, failureReason]
+      required:
+        - index
+        - stepId
+        - stepLabel
+        - slotKey
+        - enteredAt
+        - leftAt
+        - failureReason
       properties:
         stepId: { type: string }
         stepLabel: { type: [string, 'null'] }
@@ -3149,10 +4138,23 @@ components:
         enteredAt: { type: string, format: date-time }
         leftAt: { type: string, format: date-time }
         failureReason: { type: [string, 'null'] }
+        index:
+          type: integer
 
     WorkflowRun:
       type: object
-      required: [id, createdAt, updatedAt, versionId, status, failureReason, stepHistory]
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - versionId
+        - status
+        - failureReason
+        - stepHistory
+        - stepCount
+        - parentRunId
+        - parentExecutionOrdinal
+        - nextHistoryBeforeIndex
       properties:
         id: { type: string }
         createdAt: { type: string, format: date-time }
@@ -3165,10 +4167,46 @@ components:
         stepHistory:
           type: array
           items: { $ref: '#/components/schemas/WorkflowRunStepHistoryRecord' }
+        stepCount:
+          type: integer
+          description: Persisted execution ordinal; not the length of this history window.
+        parentRunId:
+          type:
+            - string
+            - "null"
+        parentExecutionOrdinal:
+          type:
+            - integer
+            - "null"
+        nextHistoryBeforeIndex:
+          type:
+            - integer
+            - "null"
+          description: Pass as history_before to get earlier history; null when no earlier cursor is available.
+      example:
+        id: wfr_BcwDvBUeSaSDILA5tHgpmU7I
+        createdAt: 2026-09-14T10:30:00.000Z
+        updatedAt: 2026-09-14T10:30:01.000Z
+        versionId: wfv_BcwDvBUeSaSDILA5tHgpmU7I
+        status: running
+        failureReason: null
+        stepHistory:
+          - index: 0
+            stepId: wfs_BcwDvBUeSaSDILA5tHgpmU7I
+            stepLabel: Incoming webhook
+            slotKey: next
+            enteredAt: 2026-09-14T10:30:00.000Z
+            leftAt: 2026-09-14T10:30:01.000Z
+            failureReason: null
+        stepCount: 1
+        parentRunId: null
+        parentExecutionOrdinal: null
+        nextHistoryBeforeIndex: null
 
     FormContactInput:
       type: object
-      description: Flat contact input for the form's contact schema. Custom attribute keys are passed at the top level.
+      description: Flat contact input for the form's contact schema. Custom attribute keys are passed at
+        the top level.
       properties:
         id: { type: [string, 'null'] }
         fullName: { type: [string, 'null'] }
@@ -3188,6 +4226,13 @@ components:
       type: object
       required: [contact]
       properties:
+        submissionId:
+          type: string
+          pattern: '^rpi1\.[0-9]{13}\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          description: >-
+            Stable ID for one input, required when direct contact creation needs AI auto-fill.
+            Format rpi1.<Unix milliseconds>.<UUIDv4>. Keep the original ID with the original input
+            for retries. The recovery window is 24 hours rounded up to the next minute.
         contact: { $ref: '#/components/schemas/FormContactInput' }
         emailMarketingConsent: { type: [boolean, 'null'] }
         captchaToken: { type: [string, 'null'] }
@@ -3202,3 +4247,176 @@ components:
           required: [status]
           properties:
             status: { type: string, const: verification_pending }
+    RecordDeletionStatus:
+      type: object
+      required:
+        - operationId
+        - status
+        - canCancel
+        - message
+      properties:
+        operationId:
+          type: string
+          description: Opaque deletion operation identifier. Preserve the whole value.
+        status:
+          type: string
+          enum:
+            - pending
+            - blocked
+            - completed
+            - cancelled
+        canCancel:
+          type: boolean
+          description: Advisory cancellation flag. The public status read returns false; the cancellation route validates current requester, write permission and phase independently.
+        message:
+          type: string
+      example:
+        operationId: delete:records:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        status: pending
+        canCancel: false
+        message: Record deletion is in progress.
+    EventStatus:
+      type: object
+      required:
+        - id
+        - eventId
+        - receivedAt
+        - occurredAt
+        - readyAt
+        - readinessState
+        - definitionRevision
+        - contactId
+        - objectId
+        - data
+      properties:
+        id:
+          type: string
+        eventId:
+          type:
+            - string
+            - "null"
+        receivedAt:
+          type: string
+          format: date-time
+        occurredAt:
+          type: string
+          format: date-time
+        readyAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        readinessState:
+          type: string
+          enum:
+            - pending
+            - ready
+            - failed
+            - outcome_unknown
+        definitionRevision:
+          type: string
+        contactId:
+          type:
+            - string
+            - "null"
+        objectId:
+          type:
+            - string
+            - "null"
+        data:
+          type: object
+          additionalProperties: true
+          description: Raw accepted input until readiness; prepared data when ready.
+      example:
+        id: ev_BcwDvBUeSaSDILA5tHgpmU7I
+        eventId: order_1042_paid
+        receivedAt: 2026-09-14T10:30:00.000Z
+        occurredAt: 2026-09-14T10:30:00.000Z
+        readyAt: null
+        readinessState: pending
+        definitionRevision: f2d9685136d4746456815a2b8a6d7a3f9eba98dfc4d6129497778d5037410d7a
+        contactId: null
+        objectId: null
+        data:
+          amount: 42
+    EventIdentityInput:
+      type: object
+      additionalProperties: false
+      required:
+        - sourceId
+        - subjectSchemaId
+        - anonymousId
+        - contactId
+        - operationId
+        - expectedAliasRevision
+      properties:
+        sourceId:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$
+          description: Source id matching an enabled contact track definition.
+          example: source_website
+        subjectSchemaId:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$
+          description: Contact schema id (not a slug) used by the track.
+          example: sch_BcwDvBUeSaSDILA5tHgpmU7I
+        anonymousId:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$
+          description: Browser identity in the configured source.
+          example: visitor_1042
+        contactId:
+          type:
+            - string
+            - "null"
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$
+          description: Contact in the subject schema, or null to unbind.
+          example: con_BcwDvBUeSaSDILA5tHgpmU7I
+        operationId:
+          type: string
+          format: uuid
+          description: Stable UUID for this identity change; reuse the same body on retries.
+          example: e125aecb-8b4e-4c7e-8f08-8f768bced7ab
+        expectedAliasRevision:
+          type: string
+          pattern: ^(0|[1-9][0-9]{0,17})$
+          description: Last known revision for this alias. Use "0" only for a new alias.
+          example: "0"
+    EventIdentityResult:
+      type: object
+      required:
+        - identityRevision
+        - affectedSubjectIds
+        - isDuplicate
+      properties:
+        identityRevision:
+          type: string
+          description: Committed revision as a decimal string; do not coerce to a floating-point number.
+        affectedSubjectIds:
+          type: array
+          items:
+            type: string
+          description: Previous and new bound contacts whose track results can change.
+        isDuplicate:
+          type: boolean
+    IdempotencyUnknownError:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              const: idempotency_outcome_unknown
+            message:
+              type: string
+            operationId:
+              type: string
+            type:
+              type: string
+              description: May be omitted on a persistence failure.

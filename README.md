@@ -25,7 +25,7 @@ Point any OpenAPI tool at `openapi.yaml`: generate a client, import into Postman
 ## The API in one screen
 
 - Base URL: `https://api.maxclicks.ai/v1` (production), `https://api-stage.maxclicks.ai/v1` (staging).
-- Auth: `Authorization: Bearer <api_key>` on every endpoint except the public form and email actions.
+- Auth: `Authorization: Bearer <api_key or OAuth access token>` on every endpoint except the public form and email actions. OAuth clients discover the authorization server at `https://api.maxclicks.ai/.well-known/oauth-authorization-server` (dynamic registration, PKCE S256).
 - Success envelope: `{ "data": ... }` (plus an optional `warnings` array). Lists add `pagination`.
 - Error envelope: `{ "error": { "type", "code", "message" } }`.
 - Pagination: `limit` (default 50, max 200) and `offset` (default 0, max 10000).
